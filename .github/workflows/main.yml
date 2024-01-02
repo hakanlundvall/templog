@@ -14,17 +14,27 @@ jobs:
             ~/.cache/pip
             ~/.platformio/.cache
           key: ${{ runner.os }}-pio
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'  
+      - name: Install dependencies
+        run: npm install @actions/http-client
       - uses: actions/setup-python@v4
         with:
           python-version: '3.9'
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
-
+        
       - name: Build PlatformIO Project
         run: pio run
-      
       - name: Upload firmware
         uses: actions/upload-artifact@v2
         with:
           name: firmware
           path: .pio/build/featheresp32/firmware.bin
+      - name: HTTP Push
+        run: node http-push.js
+        env:
+          COMMIT_HASH: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}

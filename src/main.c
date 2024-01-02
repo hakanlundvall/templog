@@ -16,7 +16,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-
+#include "driver/gpio.h"
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
@@ -25,7 +25,7 @@
 uint8_t ssid[32];
 uint8_t password[64];
 char url[100];
-#define MAXIMUM_RETRY  3
+#define MAXIMUM_RETRY 3
 
 #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA2_PSK
 #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_BOTH
@@ -34,35 +34,50 @@ char url[100];
 static EventGroupHandle_t s_wifi_event_group;
 
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
+#define WIFI_FAIL_BIT BIT1
 
 static const char *TAG = "temp-logger";
 
 static int s_retry_num = 0;
+static uint32_t level2 = 0;
 
 static void log_error_if_nonzero(const char *message, int error_code)
 {
-    if (error_code != 0) {
+    if (error_code != 0)
+    {
         ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
     }
 }
 
-static void event_handler(void* arg, esp_event_base_t event_base,
-                                int32_t event_id, void* event_data)
+static void event_handler(void *arg, esp_event_base_t event_base,
+                          int32_t event_id, void *event_data)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
         esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < MAXIMUM_RETRY) {
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED)
+    {
+        level2 = 0;
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        level2 = 1;
+        if (s_retry_num < MAXIMUM_RETRY)
+        {
             esp_wifi_connect();
             s_retry_num++;
             ESP_LOGI(TAG, "retry to connect to the AP");
-        } else {
+        }
+        else
+        {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
-        ESP_LOGI(TAG,"connect to the AP fail");
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "connect to the AP fail");
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
@@ -105,37 +120,45 @@ void wifi_init_sta(void)
     };
     memcpy(wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
     memcpy(wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
-    ESP_ERROR_CHECK(esp_wifi_start() );
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           portMAX_DELAY);
 
-    if (bits & WIFI_CONNECTED_BIT) {
+    if (bits & WIFI_CONNECTED_BIT)
+    {
         ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
                  ssid, password);
-    } else if (bits & WIFI_FAIL_BIT) {
+    }
+    else if (bits & WIFI_FAIL_BIT)
+    {
         ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
                  ssid, password);
-    } else {
+    }
+    else
+    {
         ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
 }
-
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
     esp_mqtt_event_handle_t event = event_data;
-    switch ((esp_mqtt_event_id_t)event_id) {
+
+    switch ((esp_mqtt_event_id_t)event_id)
+    {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        esp_mqtt_client_publish(event->client, "/temp/1/status", "connected", 0, 1, 0);
+
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -157,10 +180,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
-        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT)
+        {
             log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
             log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
-            log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
+            log_error_if_nonzero("captured as transport's socket errno", event->error_handle->esp_transport_sock_errno);
             ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
         }
         break;
@@ -172,50 +196,79 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
 static esp_mqtt_client_handle_t mqtt_app_start(void)
 {
+    static char lwt_msg[] = "disconnected";
+    static char connect_msg[] = "start";
+    static char status_topic[] = "/temp/1/status";
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = url,
+        .session.last_will.msg = lwt_msg,
+        .session.last_will.msg_len = sizeof(lwt_msg) - 1,
+        .session.last_will.qos = 1,
+        .session.last_will.topic = status_topic,
+        .session.last_will.retain = 0,
+        .session.keepalive = 9,
     };
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
     /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
+    esp_mqtt_client_publish(client, status_topic, connect_msg, sizeof(connect_msg) - 1, 1, 0);
+
     return client;
 }
 
+#define GPIO_DS18B20_0 (25)
+#define MAX_DEVICES (8)
+#define DS18B20_RESOLUTION (DS18B20_RESOLUTION_12_BIT)
+#define SAMPLE_PERIOD (1000) // milliseconds
 
-#define GPIO_DS18B20_0       (25)
-#define MAX_DEVICES          (8)
-#define DS18B20_RESOLUTION   (DS18B20_RESOLUTION_12_BIT)
-#define SAMPLE_PERIOD        (10000)   // milliseconds
-
-bool read_value(nvs_handle_t handle, const char* key, uint8_t* value, size_t* length)
+bool read_value(nvs_handle_t handle, const char *key, uint8_t *value, size_t *length)
 {
     printf("Reading  from NVS ... ");
-    esp_err_t ret = nvs_get_str(handle, key, (char*)value, length);
-    switch (ret) {
-        case ESP_OK:
-            printf("Done\n");
-            printf("%s = %s\n", key, value);
-            return true;
-        case ESP_ERR_NVS_NOT_FOUND:
-            printf("The value is not initialized yet!\n");
-            break;
-        default :
-            printf("Error (%s) reading!\n", esp_err_to_name(ret));
+    esp_err_t ret = nvs_get_str(handle, key, (char *)value, length);
+    switch (ret)
+    {
+    case ESP_OK:
+        printf("Done\n");
+        printf("%s = %s\n", key, value);
+        return true;
+    case ESP_ERR_NVS_NOT_FOUND:
+        printf("The value is not initialized yet!\n");
+        break;
+    default:
+        printf("Error (%s) reading!\n", esp_err_to_name(ret));
     }
     return false;
 }
+
 _Noreturn void app_main()
 {
     // Override global log level
     esp_log_level_set("*", ESP_LOG_INFO);
+    uint32_t level = 1;
+    gpio_config_t io_conf = {};
 
-
-    //Initialize NVS
+    // disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    // set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    // bit mask of the pins that you want to set,e.g.GPIO18/19
+    io_conf.pin_bit_mask = (1ULL << GPIO_NUM_27) | (1ULL << GPIO_NUM_18) | (1ULL << GPIO_NUM_19);
+    // disable pull-down mode
+    io_conf.pull_down_en = 0;
+    // disable pull-up mode
+    io_conf.pull_up_en = 0;
+    // configure GPIO with the given settings
+    gpio_config(&io_conf);
+    gpio_set_level(GPIO_NUM_27, level);
+    gpio_set_level(GPIO_NUM_18, level2);
+    gpio_set_level(GPIO_NUM_19, !level);
+    // Initialize NVS
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-      ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
 
@@ -223,9 +276,12 @@ _Noreturn void app_main()
     printf("Opening Non-Volatile Storage (NVS) handle... ");
     nvs_handle_t my_handle;
     ret = nvs_open("connection", NVS_READWRITE, &my_handle);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         printf("Error (%s) opening NVS handle!\n", esp_err_to_name(ret));
-    } else {
+    }
+    else
+    {
         printf("Done\n");
 
         // Read
@@ -238,6 +294,7 @@ _Noreturn void app_main()
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             esp_restart();
         }
+        // memcpy(ssid, "Grythem464", 11);
         length = sizeof(password);
         if (!read_value(my_handle, "PW", password, &length))
         {
@@ -247,7 +304,7 @@ _Noreturn void app_main()
             esp_restart();
         }
         length = sizeof(url);
-        if (!read_value(my_handle, "MQTT", (uint8_t*)url, &length))
+        if (!read_value(my_handle, "MQTT", (uint8_t *)url, &length))
         {
             printf("Restarting now.\n");
             fflush(stdout);
@@ -256,7 +313,6 @@ _Noreturn void app_main()
         }
     }
 
-
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
     esp_mqtt_client_handle_t client = mqtt_app_start();
@@ -264,14 +320,17 @@ _Noreturn void app_main()
     vTaskDelay(2000.0 / portTICK_PERIOD_MS);
 
     // Create a 1-Wire bus, using the RMT timeslot driver
-    OneWireBus * owb;
+    OneWireBus *owb;
     owb_rmt_driver_info rmt_driver_info;
     owb = owb_rmt_initialize(&rmt_driver_info, GPIO_DS18B20_0, RMT_CHANNEL_1, RMT_CHANNEL_0);
-    owb_use_crc(owb, true);  // enable CRC check for ROM code
+    owb_use_crc(owb, true); // enable CRC check for ROM code
 
     // Find all connected devices
     printf("Find devices:\n");
     OneWireBus_ROMCode device_rom_codes[MAX_DEVICES] = {0};
+    float meas[MAX_DEVICES][10];
+    int current = 0;
+    int count = 0;
     int num_devices = 0;
     OneWireBus_SearchState search_state = {0};
     bool found = false;
@@ -288,41 +347,36 @@ _Noreturn void app_main()
     printf("Found %d device%s\n", num_devices, num_devices == 1 ? "" : "s");
 
     // Create DS18B20 devices on the 1-Wire bus
-    DS18B20_Info * devices[MAX_DEVICES] = {0};
+    DS18B20_Info *devices[MAX_DEVICES] = {0};
     for (int i = 0; i < num_devices; ++i)
     {
-        DS18B20_Info * ds18b20_info = ds18b20_malloc();  // heap allocation
+        DS18B20_Info *ds18b20_info = ds18b20_malloc(); // heap allocation
         devices[i] = ds18b20_info;
 
         if (num_devices == 1)
         {
             printf("Single device optimisations enabled\n");
-            ds18b20_init_solo(ds18b20_info, owb);          // only one device on bus
+            ds18b20_init_solo(ds18b20_info, owb); // only one device on bus
         }
         else
         {
             ds18b20_init(ds18b20_info, owb, device_rom_codes[i]); // associate with bus and device
         }
-        ds18b20_use_crc(ds18b20_info, true);           // enable CRC check on all reads
+        ds18b20_use_crc(ds18b20_info, true); // enable CRC check on all reads
         ds18b20_set_resolution(ds18b20_info, DS18B20_RESOLUTION);
     }
 
     // Check for parasitic-powered devices
     bool parasitic_power = false;
     ds18b20_check_for_parasite_power(owb, &parasitic_power);
-    if (parasitic_power) {
+    if (parasitic_power)
+    {
         printf("Parasitic-powered devices detected");
     }
 
     // In parasitic-power mode, devices cannot indicate when conversions are complete,
     // so waiting for a temperature conversion must be done by waiting a prescribed duration
     owb_use_parasitic_power(owb, parasitic_power);
-
-#ifdef CONFIG_ENABLE_STRONG_PULLUP_GPIO
-    // An external pull-up circuit is used to supply extra current to OneWireBus devices
-    // during temperature conversions.
-    owb_use_strong_pullup_gpio(owb, CONFIG_STRONG_PULLUP_GPIO);
-#endif
 
     // Read temperatures more efficiently by starting conversions on all devices at the same time
     int errors_count[MAX_DEVICES] = {0};
@@ -333,6 +387,8 @@ _Noreturn void app_main()
 
         while (1)
         {
+            if (count < 10)
+                ++count;
             ds18b20_convert_all(owb);
 
             // In this application all devices use the same resolution,
@@ -341,8 +397,8 @@ _Noreturn void app_main()
 
             // Read the results immediately after conversion otherwise it may fail
             // (using printf before reading may take too long)
-            float readings[MAX_DEVICES] = { 0 };
-            DS18B20_ERROR errors[MAX_DEVICES] = { 0 };
+            float readings[MAX_DEVICES] = {0};
+            DS18B20_ERROR errors[MAX_DEVICES] = {0};
 
             for (int i = 0; i < num_devices; ++i)
             {
@@ -363,15 +419,33 @@ _Noreturn void app_main()
                 char buf[10];
                 char topic[100];
                 printf("  %s: %.1f    %d errors\n", rom_code_s, readings[i], errors_count[i]);
-                int len = snprintf(buf, 10, "%.1f", readings[i]);
+                meas[i][current] = readings[i];
+                float sum = 0;
+                for (int j = 0; j < 10 && j < count; ++j)
+                    sum += meas[i][j];
+                int len = snprintf(buf, 10, "%.2f", sum / (float)count);
                 snprintf(topic, 100, "/test/temp%d", i);
-                if (len > 0 ) 
+                if (len > 0)
                 {
                     int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
                     ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
                 }
-
+                if (sample_count % 10 == 0)
+                {
+                    snprintf(topic, 100, "/temp/%s", rom_code_s);
+                    if (len > 0)
+                    {
+                        int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
+                        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+                    }
+                }
             }
+            current++;
+            current %= 10;
+            level = level ? 0 : 1;
+            gpio_set_level(GPIO_NUM_27, level);
+            gpio_set_level(GPIO_NUM_18, level2);
+            gpio_set_level(GPIO_NUM_19, !level);
 
             vTaskDelayUntil(&last_wake_time, SAMPLE_PERIOD / portTICK_PERIOD_MS);
         }
@@ -379,6 +453,15 @@ _Noreturn void app_main()
     else
     {
         printf("\nNo DS18B20 devices detected!\n");
+    }
+
+    while (1)
+    {
+        level = level ? 0 : 1;
+        gpio_set_level(GPIO_NUM_27, level);
+        gpio_set_level(GPIO_NUM_18, level2);
+        gpio_set_level(GPIO_NUM_19, !level);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 
     // clean up dynamically allocated data

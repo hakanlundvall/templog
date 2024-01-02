@@ -328,7 +328,11 @@ _Noreturn void app_main()
     // Find all connected devices
     printf("Find devices:\n");
     OneWireBus_ROMCode device_rom_codes[MAX_DEVICES] = {0};
-    float meas[MAX_DEVICES][10];
+    const int AVG_COUNT = 10;
+    float meas[MAX_DEVICES][AVG_COUNT];
+    for (int i = 0; i < AVG_COUNT; ++i)
+        for (int j = 0; j < MAX_DEVICES; ++j)
+            meas[j][i] = 0;
     int current = 0;
     int count = 0;
     int num_devices = 0;
@@ -387,7 +391,7 @@ _Noreturn void app_main()
 
         while (1)
         {
-            if (count < 10)
+            if (count < AVG_COUNT)
                 ++count;
             ds18b20_convert_all(owb);
 
@@ -410,29 +414,39 @@ _Noreturn void app_main()
             for (int i = 0; i < num_devices; ++i)
             {
                 char rom_code_s[17];
+                bool publish_error = false;
                 owb_string_from_rom_code(devices[i]->rom_code, rom_code_s, sizeof(rom_code_s));
 
                 if (errors[i] != DS18B20_OK)
                 {
                     ++errors_count[i];
+                    meas[i][current] = meas[i][(current + AVG_COUNT - 1) % AVG_COUNT];
+                    publish_error = true;
+                }
+                else
+                {
+                    meas[i][current] = readings[i];
                 }
                 char buf[10];
                 char topic[100];
                 printf("  %s: %.1f    %d errors\n", rom_code_s, readings[i], errors_count[i]);
-                meas[i][current] = readings[i];
                 float sum = 0;
                 for (int j = 0; j < 10 && j < count; ++j)
                     sum += meas[i][j];
-                int len = snprintf(buf, 10, "%.2f", sum / (float)count);
-                snprintf(topic, 100, "/test/temp%d", i);
-                if (len > 0)
+                if (sample_count % AVG_COUNT == 0)
                 {
-                    int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
-                    ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
-                }
-                if (sample_count % 10 == 0)
-                {
+                    int len = snprintf(buf, 10, "%.2f", sum / (float)count);
                     snprintf(topic, 100, "/temp/%s", rom_code_s);
+                    if (len > 0)
+                    {
+                        int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
+                        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+                    }
+                }
+                if (publish_error)
+                {
+                    int len = snprintf(buf, 10, "%d", errors_count[i]);
+                    snprintf(topic, 100, "/temp/errors/%s", rom_code_s);
                     if (len > 0)
                     {
                         int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
@@ -441,7 +455,7 @@ _Noreturn void app_main()
                 }
             }
             current++;
-            current %= 10;
+            current %= AVG_COUNT;
             level = level ? 0 : 1;
             gpio_set_level(GPIO_NUM_27, level);
             gpio_set_level(GPIO_NUM_18, level2);

@@ -23,6 +23,7 @@ jobs:
       - name: HTTP Push
         run: node http-push.js
         env:
+          COMMIT_HASH: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
       - uses: actions/setup-python@v4
         with:

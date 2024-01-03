@@ -28,13 +28,13 @@ let httpc = new http.HttpClient('github-actions');
         throw new Error(`Failed to push: ${res.message.statusMessage}`);
     }
 
-    const fs = require('fs').promises;
+    const fs = require('fs');
 
     let firmwarePath = '.pio/build/featheresp32/firmware.bin';
-    let firmwareData = await fs.readFile(firmwarePath);
+    let firmwareStream = fs.createReadStream(firmwarePath);
     headers = { 'Content-Type': 'application/octet-stream'}
 
-    res = await httpc.post(`https://www.lundvall.info/templog/firmware/upload/${commit_hash}`, firmwareData, headers);
+    res = await httpc.post(`https://www.lundvall.info/templog/firmware/upload/${commit_hash}`, firmwareStream, headers);
     if (res.message.statusCode != 200) {
         throw new Error(`Failed to push: ${res.message.statusMessage}`);
     }

@@ -111,11 +111,12 @@ void wifi_init_sta(void)
 
     wifi_config_t wifi_config = {
         .sta = {
+            .threshold.authmode = WIFI_AUTH_OPEN,
             // .ssid = ssid,
             // .password = password,
-            .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-            .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
-            .sae_h2e_identifier = H2E_IDENTIFIER,
+            // .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
+            // .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
+            // .sae_h2e_identifier = H2E_IDENTIFIER,
         },
     };
     memcpy(wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
@@ -157,7 +158,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-        esp_mqtt_client_publish(event->client, "/temp/1/status", "connected", 0, 1, 0);
+        // esp_mqtt_client_publish(event->client, "/temp/1/status", "connected", 0, 1, 0);
 
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -287,35 +288,38 @@ _Noreturn void app_main()
         // Read
         printf("Reading  from NVS ... ");
         size_t length = sizeof(ssid);
-        if (!read_value(my_handle, "SSID", ssid, &length))
-        {
-            printf("Restarting now.\n");
-            fflush(stdout);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            esp_restart();
-        }
-        // memcpy(ssid, "Grythem464", 11);
+        // if (!read_value(my_handle, "SSID", ssid, &length))
+        // {
+        //     printf("Restarting now.\n");
+        //     fflush(stdout);
+        //     vTaskDelay(1000 / portTICK_PERIOD_MS);
+        //     esp_restart();
+        // }
         length = sizeof(password);
-        if (!read_value(my_handle, "PW", password, &length))
-        {
-            printf("Restarting now.\n");
-            fflush(stdout);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            esp_restart();
-        }
+        // if (!read_value(my_handle, "PW", password, &length))
+        // {
+        //     printf("Restarting now.\n");
+        //     fflush(stdout);
+        //     vTaskDelay(1000 / portTICK_PERIOD_MS);
+        //     esp_restart();
+        // }
         length = sizeof(url);
-        if (!read_value(my_handle, "MQTT", (uint8_t *)url, &length))
-        {
-            printf("Restarting now.\n");
-            fflush(stdout);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            esp_restart();
-        }
+        // if (!read_value(my_handle, "MQTT", (uint8_t *)url, &length))
+        // {
+        //     printf("Restarting now.\n");
+        //     fflush(stdout);
+        //     vTaskDelay(1000 / portTICK_PERIOD_MS);
+        //     esp_restart();
+        // }
+        memcpy(ssid, "Wokwi-GUEST", 12);
+        memcpy(password, "", 1);
+        memcpy(url, "mqtt://mqtt.eclipseprojects.io", 31);
     }
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
-    esp_mqtt_client_handle_t client = mqtt_app_start();
+    // esp_mqtt_client_handle_t client = mqtt_app_start();
+    esp_mqtt_client_handle_t client = NULL;
     // Stable readings require a brief period before communication
     vTaskDelay(2000.0 / portTICK_PERIOD_MS);
 
@@ -437,7 +441,7 @@ _Noreturn void app_main()
                 {
                     int len = snprintf(buf, 10, "%.2f", sum / (float)count);
                     snprintf(topic, 100, "/temp/%s", rom_code_s);
-                    if (len > 0)
+                    if (len > 0 && client)
                     {
                         int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
                         ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
@@ -447,7 +451,7 @@ _Noreturn void app_main()
                 {
                     int len = snprintf(buf, 10, "%d", errors_count[i]);
                     snprintf(topic, 100, "/temp/errors/%s", rom_code_s);
-                    if (len > 0)
+                    if (len > 0 && client)
                     {
                         int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
                         ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);

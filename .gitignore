@@ -6,3 +6,6 @@
 src/nvs.cvs
 compile_commands.json
 *.bin
+__pycache__/
+*.pyc
+rpi/*.egg-info/

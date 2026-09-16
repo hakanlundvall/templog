@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "templog-ble"
+version = "0.1.0"
+description = "Raspberry Pi service and CLI for controlling a templog ESP32 device over BLE"
+requires-python = ">=3.9"
+dependencies = [
+    "bleak>=0.21",
+]
+
+[project.scripts]
+templog-ble = "templog_ble.service:main"
+templogctl = "templog_ble.cli:main"
+
+[tool.setuptools]
+packages = ["templog_ble"]

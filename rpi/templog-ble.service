@@ -1,0 +1,17 @@
+[Unit]
+Description=templog BLE bridge service
+After=bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/templog-ble
+Restart=always
+RestartSec=2
+# Needed for BlueZ D-Bus / BLE access without running as root.
+SupplementaryGroups=bluetooth
+AmbientCapabilities=CAP_NET_ADMIN
+RuntimeDirectory=templog-ble
+
+[Install]
+WantedBy=multi-user.target

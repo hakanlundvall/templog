@@ -28,6 +28,10 @@ typedef struct {
     bool wifi_connected;
     char wifi_ssid[33];
     bool heater_on;
+    float heater_on_threshold_c;
+    float heater_off_threshold_c;
+    /* 0 = automatic, 1 = forced off until conditions met again, 2 = forced off until explicitly started */
+    int heater_force_state;
 } ble_telemetry_t;
 
 typedef enum {

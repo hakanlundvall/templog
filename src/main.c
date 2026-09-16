@@ -735,6 +735,9 @@ _Noreturn void app_main()
                 telemetry.wifi_connected = s_wifi_connected;
                 strlcpy(telemetry.wifi_ssid, (char *)ssid, sizeof(telemetry.wifi_ssid));
                 telemetry.heater_on = heater_on;
+                telemetry.heater_on_threshold_c = heater_on_threshold;
+                telemetry.heater_off_threshold_c = heater_off_threshold;
+                telemetry.heater_force_state = (int)heater_force_state;
                 ble_service_update_telemetry(&telemetry);
             }
 

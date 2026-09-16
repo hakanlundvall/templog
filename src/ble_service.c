@@ -405,6 +405,9 @@ void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
     cJSON_AddBoolToObject(wifi, "c", telemetry->wifi_connected);
     cJSON_AddStringToObject(wifi, "ssid", telemetry->wifi_ssid);
     cJSON_AddBoolToObject(root, "heater", telemetry->heater_on);
+    cJSON_AddNumberToObject(root, "onC", telemetry->heater_on_threshold_c);
+    cJSON_AddNumberToObject(root, "offC", telemetry->heater_off_threshold_c);
+    cJSON_AddNumberToObject(root, "forceState", telemetry->heater_force_state);
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     char *out = cJSON_PrintUnformatted(root);

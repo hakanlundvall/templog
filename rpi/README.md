@@ -86,13 +86,19 @@ templogctl heater-on                  # starts heater unless water temp already 
       {"id": "28aa550000000000", "c": 21.4, "age": 1200, "water": false}
     ],
     "wifi": {"c": true, "ssid": "MyHomeSSID"},
-    "heater": true
+    "heater": true,
+    "onC": 60.0,
+    "offC": 80.0,
+    "forceState": 0
   }
 }
 ```
 
 `age` is milliseconds since that sensor's last good reading; a missing `c`/`age`
-means the sensor has never produced a valid reading.
+means the sensor has never produced a valid reading. `onC`/`offC` are the
+current heater thresholds and `forceState` is `0` (automatic), `1` (forced
+off until start conditions are met again) or `2` (forced off until
+explicitly started).
 
 ## Security notes
 

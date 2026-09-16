@@ -164,7 +164,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
         s_mqtt_connected = true;
-        esp_mqtt_client_publish(event->client, "/temp/1/status", "connected", 0, 1, 0);
+        // esp_mqtt_client_publish(event->client, "temp/1/status", "connected", 0, 1, 0);
 
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -206,7 +206,7 @@ static esp_mqtt_client_handle_t mqtt_app_start(void)
 {
     static char lwt_msg[] = "disconnected";
     static char connect_msg[] = "start";
-    static char status_topic[] = "/temp/1/status";
+    static char status_topic[] = "temp/1/status";
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = url,
         .session.last_will.msg = lwt_msg,
@@ -216,6 +216,7 @@ static esp_mqtt_client_handle_t mqtt_app_start(void)
         .session.last_will.retain = 0,
         .session.keepalive = 9,
     };
+    ESP_LOGI(TAG, "Starting MQTT client URL: %s", url);
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
     /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -254,9 +255,14 @@ static void connection_monitor_task(void *arg)
 }
 
 #define GPIO_DS18B20_0 (25)
+#define GPIO_HEATER GPIO_NUM_27
 #define MAX_DEVICES (8)
 #define DS18B20_RESOLUTION (DS18B20_RESOLUTION_12_BIT)
 #define SAMPLE_PERIOD (1000) // milliseconds
+#define WATER_TEMP_IDENTIFICATION_THRESHOLD 80.0f
+#define HEATER_OFF_THRESHOLD 80.0f
+#define HEATER_ON_THRESHOLD 60.0f
+#define TEMP_READING_TIMEOUT_MS 60000
 
 bool read_value(nvs_handle_t handle, const char *key, uint8_t *value, size_t *length)
 {
@@ -296,7 +302,7 @@ _Noreturn void app_main()
     io_conf.pull_up_en = 0;
     // configure GPIO with the given settings
     gpio_config(&io_conf);
-    gpio_set_level(GPIO_NUM_27, level);
+    gpio_set_level(GPIO_HEATER, false);
     gpio_set_level(GPIO_NUM_18, level2);
     gpio_set_level(GPIO_NUM_19, !level);
     // Initialize NVS
@@ -373,6 +379,10 @@ _Noreturn void app_main()
     int current = 0;
     int count = 0;
     int num_devices = 0;
+    int water_sensor_index = -1;
+    bool heater_on = false;
+    bool has_good_temp_reading = false;
+    TickType_t last_good_temp_reading = 0;
     OneWireBus_SearchState search_state = {0};
     bool found = false;
     owb_search_first(owb, &search_state, &found);
@@ -446,6 +456,66 @@ _Noreturn void app_main()
                 errors[i] = ds18b20_read_temp(devices[i], &readings[i]);
             }
 
+            bool good_temp_reading = false;
+            for (int i = 0; i < num_devices; ++i)
+            {
+                if (errors[i] == DS18B20_OK)
+                {
+                    good_temp_reading = true;
+                    break;
+                }
+            }
+
+            if (good_temp_reading)
+            {
+                has_good_temp_reading = true;
+                last_good_temp_reading = xTaskGetTickCount();
+                if (water_sensor_index < 0)
+                {
+                    heater_on = true;
+                }
+            }
+
+            for (int i = 0; i < num_devices; ++i)
+            {
+                if (errors[i] != DS18B20_OK)
+                {
+                    continue;
+                }
+
+                if (water_sensor_index < 0 && readings[i] >= WATER_TEMP_IDENTIFICATION_THRESHOLD)
+                {
+                    water_sensor_index = i;
+                    heater_on = false;
+                    ESP_LOGI(TAG, "Sensor %d identified as water temperature; heater off at %.1f C", i, readings[i]);
+                }
+
+                if (i == water_sensor_index)
+                {
+                    if (heater_on && readings[i] >= HEATER_OFF_THRESHOLD)
+                    {
+                        heater_on = false;
+                        ESP_LOGI(TAG, "Water temperature reached %.1f C; heater off", readings[i]);
+                    }
+                    else if (!heater_on && readings[i] <= HEATER_ON_THRESHOLD)
+                    {
+                        heater_on = true;
+                        ESP_LOGI(TAG, "Water temperature dropped to %.1f C; heater on", readings[i]);
+                    }
+                }
+            }
+
+            if (!has_good_temp_reading ||
+                (xTaskGetTickCount() - last_good_temp_reading) >= pdMS_TO_TICKS(TEMP_READING_TIMEOUT_MS))
+            {
+                if (heater_on)
+                {
+                    ESP_LOGW(TAG, "No valid temperature reading for %d seconds; heater off", TEMP_READING_TIMEOUT_MS / 1000);
+                }
+                heater_on = false;
+            }
+            gpio_set_level(GPIO_HEATER, heater_on);
+
             // Print results in a separate loop, after all have been read
             printf("\nTemperature readings (degrees C): sample %d\n", ++sample_count);
             for (int i = 0; i < num_devices; ++i)
@@ -473,7 +543,7 @@ _Noreturn void app_main()
                 if (sample_count % AVG_COUNT == 0)
                 {
                     int len = snprintf(buf, 10, "%.2f", sum / (float)count);
-                    snprintf(topic, 100, "/temp/%s", rom_code_s);
+                    snprintf(topic, 100, "temp/%s", rom_code_s);
                     if (len > 0)
                     {
                         int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
@@ -483,7 +553,7 @@ _Noreturn void app_main()
                 if (publish_error)
                 {
                     int len = snprintf(buf, 10, "%d", errors_count[i]);
-                    snprintf(topic, 100, "/temp/errors/%s", rom_code_s);
+                    snprintf(topic, 100, "temp/errors/%s", rom_code_s);
                     if (len > 0)
                     {
                         int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
@@ -494,7 +564,6 @@ _Noreturn void app_main()
             current++;
             current %= AVG_COUNT;
             level = level ? 0 : 1;
-            gpio_set_level(GPIO_NUM_27, level);
             gpio_set_level(GPIO_NUM_18, level2);
             gpio_set_level(GPIO_NUM_19, !level);
 
@@ -509,7 +578,7 @@ _Noreturn void app_main()
     while (1)
     {
         level = level ? 0 : 1;
-        gpio_set_level(GPIO_NUM_27, level);
+        gpio_set_level(GPIO_HEATER, heater_on);
         gpio_set_level(GPIO_NUM_18, level2);
         gpio_set_level(GPIO_NUM_19, !level);
         vTaskDelay(1000 / portTICK_PERIOD_MS);

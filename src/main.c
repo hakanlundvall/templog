@@ -21,6 +21,11 @@
 #include "lwip/sys.h"
 
 #include "mqtt_client.h"
+#include "freertos/queue.h"
+#include <math.h>
+#include <strings.h>
+
+#include "ble_service.h"
 
 uint8_t ssid[32];
 uint8_t password[64];
@@ -42,6 +47,24 @@ static int s_retry_num = 0;
 static uint32_t level2 = 0;
 static volatile bool s_wifi_connected = false;
 static volatile bool s_mqtt_connected = false;
+
+typedef enum {
+    HEATER_FORCE_NONE = 0,
+    HEATER_FORCE_OFF_UNTIL_CONDITIONS,
+    HEATER_FORCE_OFF_UNTIL_STARTED,
+} heater_force_state_t;
+
+static nvs_handle_t g_nvs_handle;
+static QueueHandle_t g_ble_cmd_queue;
+static OneWireBus_ROMCode device_rom_codes[8];
+static int num_devices = 0;
+static int water_sensor_index = -1;
+static bool water_sensor_persisted = false;
+static bool heater_on = false;
+static float last_water_temp = NAN;
+static heater_force_state_t heater_force_state = HEATER_FORCE_NONE;
+static float heater_on_threshold = 0;
+static float heater_off_threshold = 0;
 
 #define CONNECTION_RETRY_PERIOD_MS 60000
 
@@ -283,6 +306,118 @@ bool read_value(nvs_handle_t handle, const char *key, uint8_t *value, size_t *le
     return false;
 }
 
+static void apply_wifi_config(void)
+{
+    wifi_config_t wifi_config = {
+        .sta = {
+            .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
+            .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
+            .sae_h2e_identifier = H2E_IDENTIFIER,
+        },
+    };
+    memcpy(wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    memcpy(wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+    esp_wifi_disconnect();
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    s_retry_num = 0;
+    esp_wifi_connect();
+}
+
+static void process_ble_commands(void)
+{
+    ble_command_t cmd;
+    while (xQueueReceive(g_ble_cmd_queue, &cmd, 0) == pdTRUE)
+    {
+        switch (cmd.type)
+        {
+        case BLE_CMD_SET_WIFI:
+        {
+            memset(ssid, 0, sizeof(ssid));
+            memset(password, 0, sizeof(password));
+            strlcpy((char *)ssid, cmd.data.wifi.ssid, sizeof(ssid));
+            strlcpy((char *)password, cmd.data.wifi.password, sizeof(password));
+            nvs_set_str(g_nvs_handle, "SSID", (char *)ssid);
+            nvs_set_str(g_nvs_handle, "PW", (char *)password);
+            nvs_commit(g_nvs_handle);
+            apply_wifi_config();
+            ESP_LOGI(TAG, "Wi-Fi credentials updated via BLE, SSID=%s", ssid);
+            ble_service_report_status("set_wifi", true, NULL);
+            break;
+        }
+        case BLE_CMD_SET_WATER_SENSOR:
+        {
+            int idx = -1;
+            for (int i = 0; i < num_devices; ++i)
+            {
+                char rom_code_s[17];
+                owb_string_from_rom_code(device_rom_codes[i], rom_code_s, sizeof(rom_code_s));
+                if (strcasecmp(rom_code_s, cmd.data.water_sensor.rom_code_hex) == 0)
+                {
+                    idx = i;
+                    break;
+                }
+            }
+            nvs_set_str(g_nvs_handle, "waterRom", cmd.data.water_sensor.rom_code_hex);
+            nvs_commit(g_nvs_handle);
+            water_sensor_persisted = true;
+            water_sensor_index = idx;
+            last_water_temp = NAN;
+            if (idx < 0)
+            {
+                ESP_LOGW(TAG, "Water sensor %s not currently present; will apply once seen",
+                         cmd.data.water_sensor.rom_code_hex);
+                ble_service_report_status("set_water_sensor", true, "sensor not currently present; stored for later");
+            }
+            else
+            {
+                ESP_LOGI(TAG, "Water sensor set to %s (index %d)", cmd.data.water_sensor.rom_code_hex, idx);
+                ble_service_report_status("set_water_sensor", true, NULL);
+            }
+            break;
+        }
+        case BLE_CMD_SET_THRESHOLDS:
+        {
+            heater_on_threshold = cmd.data.thresholds.on_c;
+            heater_off_threshold = cmd.data.thresholds.off_c;
+            nvs_set_i32(g_nvs_handle, "heatOnC", (int32_t)lroundf(heater_on_threshold * 100.0f));
+            nvs_set_i32(g_nvs_handle, "heatOffC", (int32_t)lroundf(heater_off_threshold * 100.0f));
+            nvs_commit(g_nvs_handle);
+            ESP_LOGI(TAG, "Heater thresholds updated: on=%.1f off=%.1f", heater_on_threshold, heater_off_threshold);
+            ble_service_report_status("set_thresholds", true, NULL);
+            break;
+        }
+        case BLE_CMD_HEATER_FORCE_OFF:
+        {
+            heater_force_state = cmd.data.heater_force_off.mode == BLE_HEATER_FORCE_OFF_UNTIL_STARTED
+                                      ? HEATER_FORCE_OFF_UNTIL_STARTED
+                                      : HEATER_FORCE_OFF_UNTIL_CONDITIONS;
+            heater_on = false;
+            gpio_set_level(GPIO_HEATER, heater_on);
+            ESP_LOGI(TAG, "Heater forced off (mode=%d)", (int)heater_force_state);
+            ble_service_report_status("heater_off", true, NULL);
+            break;
+        }
+        case BLE_CMD_HEATER_ON:
+        {
+            heater_force_state = HEATER_FORCE_NONE;
+            if (!isnan(last_water_temp) && last_water_temp >= heater_off_threshold)
+            {
+                heater_on = false;
+                ESP_LOGI(TAG, "Heater start requested but water temperature %.1f is above threshold", last_water_temp);
+            }
+            else
+            {
+                heater_on = true;
+                ESP_LOGI(TAG, "Heater started via BLE command");
+            }
+            gpio_set_level(GPIO_HEATER, heater_on);
+            ble_service_report_status("heater_on", true, NULL);
+            break;
+        }
+        }
+    }
+}
+
 _Noreturn void app_main()
 {
     // Override global log level
@@ -353,7 +488,25 @@ _Noreturn void app_main()
             vTaskDelay(1000 / portTICK_PERIOD_MS);
             esp_restart();
         }
+
+        g_nvs_handle = my_handle;
+
+        char water_rom[17] = {0};
+        size_t water_rom_len = sizeof(water_rom);
+        if (nvs_get_str(my_handle, "waterRom", water_rom, &water_rom_len) == ESP_OK && water_rom[0] != '\0')
+        {
+            water_sensor_persisted = true;
+            printf("Persisted water sensor: %s\n", water_rom);
+        }
+
+        int32_t on_centi = 0, off_centi = 0;
+        heater_on_threshold = (nvs_get_i32(my_handle, "heatOnC", &on_centi) == ESP_OK) ? on_centi / 100.0f : HEATER_ON_THRESHOLD;
+        heater_off_threshold = (nvs_get_i32(my_handle, "heatOffC", &off_centi) == ESP_OK) ? off_centi / 100.0f : HEATER_OFF_THRESHOLD;
+        printf("Heater thresholds: on=%.1f off=%.1f\n", heater_on_threshold, heater_off_threshold);
     }
+
+    g_ble_cmd_queue = xQueueCreate(8, sizeof(ble_command_t));
+    ble_service_init(g_ble_cmd_queue);
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
@@ -370,7 +523,6 @@ _Noreturn void app_main()
 
     // Find all connected devices
     printf("Find devices:\n");
-    OneWireBus_ROMCode device_rom_codes[MAX_DEVICES] = {0};
     const int AVG_COUNT = 10;
     float meas[MAX_DEVICES][AVG_COUNT];
     for (int i = 0; i < AVG_COUNT; ++i)
@@ -378,11 +530,11 @@ _Noreturn void app_main()
             meas[j][i] = 0;
     int current = 0;
     int count = 0;
-    int num_devices = 0;
-    int water_sensor_index = -1;
-    bool heater_on = false;
     bool has_good_temp_reading = false;
     TickType_t last_good_temp_reading = 0;
+    TickType_t last_good_reading[MAX_DEVICES] = {0};
+    bool ever_good[MAX_DEVICES] = {0};
+    float last_good_value[MAX_DEVICES] = {0};
     OneWireBus_SearchState search_state = {0};
     bool found = false;
     owb_search_first(owb, &search_state, &found);
@@ -396,6 +548,26 @@ _Noreturn void app_main()
         owb_search_next(owb, &search_state, &found);
     }
     printf("Found %d device%s\n", num_devices, num_devices == 1 ? "" : "s");
+
+    if (water_sensor_persisted)
+    {
+        char water_rom[17] = {0};
+        size_t water_rom_len = sizeof(water_rom);
+        if (nvs_get_str(g_nvs_handle, "waterRom", water_rom, &water_rom_len) == ESP_OK)
+        {
+            for (int i = 0; i < num_devices; ++i)
+            {
+                char rom_code_s[17];
+                owb_string_from_rom_code(device_rom_codes[i], rom_code_s, sizeof(rom_code_s));
+                if (strcasecmp(rom_code_s, water_rom) == 0)
+                {
+                    water_sensor_index = i;
+                    ESP_LOGI(TAG, "Persisted water sensor %s found at index %d", water_rom, i);
+                    break;
+                }
+            }
+        }
+    }
 
     // Create DS18B20 devices on the 1-Wire bus
     DS18B20_Info *devices[MAX_DEVICES] = {0};
@@ -466,13 +638,15 @@ _Noreturn void app_main()
                 }
             }
 
+            process_ble_commands();
+
             if (good_temp_reading)
             {
                 has_good_temp_reading = true;
                 last_good_temp_reading = xTaskGetTickCount();
-                if (water_sensor_index < 0)
+                if (water_sensor_index < 0 && !water_sensor_persisted)
                 {
-                    heater_on = true;
+                    heater_on = (heater_force_state == HEATER_FORCE_NONE);
                 }
             }
 
@@ -483,7 +657,11 @@ _Noreturn void app_main()
                     continue;
                 }
 
-                if (water_sensor_index < 0 && readings[i] >= WATER_TEMP_IDENTIFICATION_THRESHOLD)
+                last_good_reading[i] = xTaskGetTickCount();
+                ever_good[i] = true;
+                last_good_value[i] = readings[i];
+
+                if (water_sensor_index < 0 && !water_sensor_persisted && readings[i] >= WATER_TEMP_IDENTIFICATION_THRESHOLD)
                 {
                     water_sensor_index = i;
                     heater_on = false;
@@ -492,15 +670,39 @@ _Noreturn void app_main()
 
                 if (i == water_sensor_index)
                 {
-                    if (heater_on && readings[i] >= HEATER_OFF_THRESHOLD)
+                    last_water_temp = readings[i];
+                    bool want_on = heater_on;
+                    if (heater_on && readings[i] >= heater_off_threshold)
                     {
-                        heater_on = false;
+                        want_on = false;
                         ESP_LOGI(TAG, "Water temperature reached %.1f C; heater off", readings[i]);
                     }
-                    else if (!heater_on && readings[i] <= HEATER_ON_THRESHOLD)
+                    else if (!heater_on && readings[i] <= heater_on_threshold)
                     {
-                        heater_on = true;
+                        want_on = true;
                         ESP_LOGI(TAG, "Water temperature dropped to %.1f C; heater on", readings[i]);
+                    }
+
+                    if (heater_force_state == HEATER_FORCE_OFF_UNTIL_STARTED)
+                    {
+                        heater_on = false;
+                    }
+                    else if (heater_force_state == HEATER_FORCE_OFF_UNTIL_CONDITIONS)
+                    {
+                        if (want_on)
+                        {
+                            heater_force_state = HEATER_FORCE_NONE;
+                            heater_on = true;
+                            ESP_LOGI(TAG, "Start conditions met again; resuming automatic heater control");
+                        }
+                        else
+                        {
+                            heater_on = false;
+                        }
+                    }
+                    else
+                    {
+                        heater_on = want_on;
                     }
                 }
             }
@@ -515,6 +717,26 @@ _Noreturn void app_main()
                 heater_on = false;
             }
             gpio_set_level(GPIO_HEATER, heater_on);
+
+            {
+                ble_telemetry_t telemetry = {0};
+                telemetry.num_readings = num_devices < BLE_MAX_TEMP_SENSORS ? num_devices : BLE_MAX_TEMP_SENSORS;
+                for (int i = 0; i < telemetry.num_readings; ++i)
+                {
+                    owb_string_from_rom_code(device_rom_codes[i], telemetry.readings[i].rom_code_hex,
+                                              sizeof(telemetry.readings[i].rom_code_hex));
+                    telemetry.readings[i].valid = ever_good[i];
+                    telemetry.readings[i].value_c = last_good_value[i];
+                    telemetry.readings[i].age_ms = ever_good[i]
+                                                        ? (uint32_t)((xTaskGetTickCount() - last_good_reading[i]) * portTICK_PERIOD_MS)
+                                                        : UINT32_MAX;
+                    telemetry.readings[i].is_water_sensor = (i == water_sensor_index);
+                }
+                telemetry.wifi_connected = s_wifi_connected;
+                strlcpy(telemetry.wifi_ssid, (char *)ssid, sizeof(telemetry.wifi_ssid));
+                telemetry.heater_on = heater_on;
+                ble_service_update_telemetry(&telemetry);
+            }
 
             // Print results in a separate loop, after all have been read
             printf("\nTemperature readings (degrees C): sample %d\n", ++sample_count);

@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
@@ -413,7 +414,7 @@ class TemplogBleClient(context: Context) {
         val cccd = characteristic.getDescriptor(Protocol.CCCD_UUID) ?: return false
         val enable = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeDescriptor(cccd, enable) == BluetoothGatt.GATT_SUCCESS
+            gatt.writeDescriptor(cccd, enable) == BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {
@@ -430,7 +431,7 @@ class TemplogBleClient(context: Context) {
                 characteristic,
                 op.value,
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-            ) == BluetoothGatt.GATT_SUCCESS
+            ) == BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {

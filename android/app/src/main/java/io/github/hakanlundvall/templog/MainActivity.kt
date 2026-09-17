@@ -72,7 +72,10 @@ class MainActivity : ComponentActivity() {
                     Manifest.permission.BLUETOOTH_CONNECT,
                 )
             } else {
-                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                arrayOf(
+                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                )
             }
     }
 }

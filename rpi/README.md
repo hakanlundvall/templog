@@ -109,6 +109,21 @@ explicitly started).
 away and only persists the URL once the client accepts it, so a URL the client
 refuses to start on leaves the previous broker in place.
 
+## Provisioning a fresh device
+
+A board whose NVS holds no `SSID`, `PW` or `MQTT` value still boots: it reads
+sensors, drives the heater and advertises over BLE, it just does not bring up
+the network. Telemetry shows this as an empty SSID and an empty broker URL.
+Pair with it and send the two commands to finish provisioning:
+
+```bash
+templogctl set-wifi "MyHomeSSID" "supersecret"
+templogctl set-mqtt mqtt://192.168.2.10:1883
+```
+
+Both take effect immediately — no reboot — and are written to NVS, so the
+device comes up configured from then on.
+
 ## Security notes
 
 * The link uses LE Secure Connections with bonding; traffic is encrypted

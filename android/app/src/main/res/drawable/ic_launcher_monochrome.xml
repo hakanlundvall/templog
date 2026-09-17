@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Single colour silhouette of the launcher icon, tinted by the system for
+     themed icons. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108"
+    android:tint="#FFFFFF">
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M54,26m-9,0a9,9 0,1 1,18 0a9,9 0,1 1,-18 0" />
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M45,26h18v38h-18z" />
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M54,72m-16,0a16,16 0,1 1,32 0a16,16 0,1 1,-32 0" />
+</vector>

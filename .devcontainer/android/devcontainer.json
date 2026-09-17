@@ -1,0 +1,24 @@
+{
+	"name": "Android (templog app)",
+	"build": {
+		"dockerfile": "Containerfile",
+		"context": "."
+	},
+	"customizations": {
+		"vscode": {
+			"settings": {
+				"terminal.integrated.defaultProfile.linux": "bash"
+			},
+			"extensions": [
+				"fwcd.kotlin",
+				"vscjava.vscode-java-pack"
+			]
+		}
+	},
+	"remoteUser": "vscode",
+	"remoteEnv": {
+		"ANDROID_HOME": "/opt/android-sdk",
+		"ANDROID_SDK_ROOT": "/opt/android-sdk"
+	},
+	"postCreateCommand": "cd android && ./gradlew --version"
+}

@@ -1,0 +1,40 @@
+# Dev container for the Android app in android/.
+#
+# Everything Android specific lives in here; nothing is installed on the host.
+# The image builds on both x86_64 and arm64, but note that Google only
+# publishes the aapt2 resource compiler for linux x86_64, so packaging an APK
+# with `./gradlew assembleDebug` only works on an x86_64 host. On arm64 (e.g. a
+# Raspberry Pi) you can still edit, resolve dependencies and run Gradle's
+# configuration phase; the APK itself is built by the GitHub Actions workflow
+# (.github/workflows/android.yml).
+FROM mcr.microsoft.com/devcontainers/java:17-bookworm
+
+ENV ANDROID_HOME=/opt/android-sdk \
+    ANDROID_SDK_ROOT=/opt/android-sdk
+
+ARG CMDLINE_TOOLS_VERSION=11076708
+ARG COMPILE_SDK=35
+ARG BUILD_TOOLS=35.0.0
+
+# adb/fastboot come from Debian rather than from sdkmanager's platform-tools,
+# because Google only ships those as x86_64 binaries.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends unzip adb fastboot \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p "$ANDROID_HOME/cmdline-tools" \
+ && curl -fsSL -o /tmp/cmdline-tools.zip \
+      "https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_TOOLS_VERSION}_latest.zip" \
+ && unzip -q /tmp/cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools" \
+ && mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest" \
+ && rm /tmp/cmdline-tools.zip
+
+ENV PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin"
+
+RUN yes | sdkmanager --licenses > /dev/null \
+ && sdkmanager --install \
+      "platforms;android-${COMPILE_SDK}" \
+      "build-tools;${BUILD_TOOLS}" \
+ && chown -R vscode:vscode "$ANDROID_HOME"
+
+USER vscode

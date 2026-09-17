@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose draws the whole UI; this only needs to give the window and the
+         splash a sane background before the first frame. -->
+    <style name="Theme.Templog" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

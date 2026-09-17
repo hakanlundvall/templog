@@ -129,6 +129,13 @@ fun TemplogScreen(
                         )
                     }
                     item {
+                        MqttCard(
+                            telemetry = snapshot,
+                            enabled = state == ConnectionState.READY && !busy,
+                            onEdit = { dialog = Dialog.Mqtt },
+                        )
+                    }
+                    item {
                         Text(
                             "Temperature sensors",
                             style = MaterialTheme.typography.titleMedium,
@@ -162,6 +169,15 @@ fun TemplogScreen(
             },
         )
 
+        Dialog.Mqtt -> MqttDialog(
+            initialUrl = telemetry?.mqttUrl.orEmpty(),
+            onDismiss = { dialog = null },
+            onConfirm = { url ->
+                dialog = null
+                viewModel.setMqtt(url)
+            },
+        )
+
         Dialog.Thresholds -> ThresholdDialog(
             initialOn = telemetry?.heaterOnThresholdC,
             initialOff = telemetry?.heaterOffThresholdC,
@@ -176,7 +192,7 @@ fun TemplogScreen(
     }
 }
 
-private enum class Dialog { Wifi, Thresholds }
+private enum class Dialog { Wifi, Mqtt, Thresholds }
 
 @Composable
 private fun ConnectionCard(
@@ -342,6 +358,73 @@ private fun WifiCard(telemetry: Telemetry, enabled: Boolean, onEdit: () -> Unit)
             }
         }
     }
+}
+
+@Composable
+private fun MqttCard(telemetry: Telemetry, enabled: Boolean, onEdit: () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("MQTT broker", style = MaterialTheme.typography.titleMedium)
+            Text(
+                telemetry.mqttUrl.ifEmpty { "no broker configured" },
+                style = MaterialTheme.typography.bodyMedium,
+                fontFamily = FontFamily.Monospace,
+            )
+            Text(
+                if (telemetry.mqttConnected) "Connected" else "Not connected",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (telemetry.mqttConnected) {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                } else {
+                    MaterialTheme.colorScheme.error
+                },
+            )
+            OutlinedButton(onClick = onEdit, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
+                Text("Change broker URL")
+            }
+        }
+    }
+}
+
+@Composable
+private fun MqttDialog(
+    initialUrl: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var url by remember { mutableStateOf(initialUrl) }
+    val trimmed = url.trim()
+    // The firmware buffer is 100 bytes including the terminator, and it
+    // rejects an empty URL outright; say so before the round trip.
+    val valid = trimmed.isNotEmpty() && trimmed.length < 100
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("MQTT broker") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it },
+                    label = { Text("Broker URI") },
+                    placeholder = { Text("mqtt://192.168.2.10:1883") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                )
+                if (trimmed.length >= 100) {
+                    Text(
+                        "The broker URL must be shorter than 100 characters.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(trimmed) }, enabled = valid) { Text("Apply") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

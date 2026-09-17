@@ -16,10 +16,12 @@ Bluetooth Low Energy, shows live telemetry, and sends the same set of commands.
   both sides.
 * **Shows status.** Every temperature sensor with its ROM code, value and
   reading age, which one is the water sensor, Wi-Fi connection state and SSID,
-  heater on/off, the on/off thresholds and the current force-off mode.
+  the MQTT broker URL and whether it is connected, heater on/off, the on/off
+  thresholds and the current force-off mode.
 * **Controls the device.** Start the heater, force it off (either until the
   start conditions are met again or until explicitly started), change the
-  thresholds, choose the water sensor, and set the Wi-Fi credentials.
+  thresholds, choose the water sensor, set the Wi-Fi credentials, and point
+  the device at a different MQTT broker.
 * **Survives a bad link.** Disconnects re-enter the connect loop with
   exponential backoff (1s doubling to 30s), matching the Pi service.
 

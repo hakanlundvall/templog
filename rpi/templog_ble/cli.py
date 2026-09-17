@@ -46,6 +46,10 @@ def cmd_set_wifi(args: argparse.Namespace) -> None:
     _issue_command(args, {"cmd": protocol.CMD_SET_WIFI, "ssid": args.ssid, "password": args.password})
 
 
+def cmd_set_mqtt(args: argparse.Namespace) -> None:
+    _issue_command(args, {"cmd": protocol.CMD_SET_MQTT, "url": args.url})
+
+
 def cmd_set_water_sensor(args: argparse.Namespace) -> None:
     _issue_command(args, {"cmd": protocol.CMD_SET_WATER_SENSOR, "id": args.sensor_id})
 
@@ -85,6 +89,10 @@ def main() -> None:
     p.add_argument("ssid")
     p.add_argument("password")
     p.set_defaults(func=cmd_set_wifi)
+
+    p = sub.add_parser("set-mqtt", help="Change the MQTT broker URL used by the ESP32")
+    p.add_argument("url", help="Broker URI, e.g. mqtt://192.168.2.10:1883")
+    p.set_defaults(func=cmd_set_mqtt)
 
     p = sub.add_parser("set-water-sensor", help="Select which DS18B20 sensor (by ROM code hex) is the water sensor")
     p.add_argument("sensor_id", help="16 hex character ROM code, e.g. from `status`")

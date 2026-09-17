@@ -47,6 +47,7 @@ static int s_retry_num = 0;
 static uint32_t level2 = 0;
 static volatile bool s_wifi_connected = false;
 static volatile bool s_mqtt_connected = false;
+static esp_mqtt_client_handle_t g_mqtt_client = NULL;
 
 typedef enum {
     HEATER_FORCE_NONE = 0,
@@ -246,6 +247,7 @@ static esp_mqtt_client_handle_t mqtt_app_start(void)
     esp_mqtt_client_start(client);
     esp_mqtt_client_publish(client, status_topic, connect_msg, sizeof(connect_msg) - 1, 1, 0);
 
+    g_mqtt_client = client;
     return client;
 }
 
@@ -323,6 +325,39 @@ static void apply_wifi_config(void)
     esp_wifi_connect();
 }
 
+/* Points the running MQTT client at whatever `url` now holds. The client
+ * copies the URI at init time, so the config struct cannot simply be mutated;
+ * stopping and restarting also means the new broker is used right away rather
+ * than at some later reconnect. */
+static bool apply_mqtt_config(const char **error)
+{
+    if (g_mqtt_client == NULL)
+    {
+        *error = "MQTT client not started yet";
+        return false;
+    }
+
+    esp_mqtt_client_stop(g_mqtt_client);
+    s_mqtt_connected = false;
+
+    esp_err_t ret = esp_mqtt_client_set_uri(g_mqtt_client, url);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_mqtt_client_set_uri failed: %s", esp_err_to_name(ret));
+        *error = "broker URL rejected";
+        return false;
+    }
+
+    ret = esp_mqtt_client_start(g_mqtt_client);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_mqtt_client_start failed: %s", esp_err_to_name(ret));
+        *error = "could not restart the MQTT client";
+        return false;
+    }
+    return true;
+}
+
 static void process_ble_commands(void)
 {
     ble_command_t cmd;
@@ -342,6 +377,32 @@ static void process_ble_commands(void)
             apply_wifi_config();
             ESP_LOGI(TAG, "Wi-Fi credentials updated via BLE, SSID=%s", ssid);
             ble_service_report_status("set_wifi", true, NULL);
+            break;
+        }
+        case BLE_CMD_SET_MQTT:
+        {
+            char previous[sizeof(url)];
+            strlcpy(previous, url, sizeof(previous));
+
+            memset(url, 0, sizeof(url));
+            strlcpy(url, cmd.data.mqtt.url, sizeof(url));
+
+            const char *error = NULL;
+            if (!apply_mqtt_config(&error))
+            {
+                /* Keep NVS and the running client consistent: put the old
+                 * broker back rather than persisting one that will not start. */
+                const char *rollback_error = NULL;
+                strlcpy(url, previous, sizeof(url));
+                apply_mqtt_config(&rollback_error);
+                ble_service_report_status("set_mqtt", false, error);
+                break;
+            }
+
+            nvs_set_str(g_nvs_handle, "MQTT", url);
+            nvs_commit(g_nvs_handle);
+            ESP_LOGI(TAG, "MQTT broker updated via BLE, URL=%s", url);
+            ble_service_report_status("set_mqtt", true, NULL);
             break;
         }
         case BLE_CMD_SET_WATER_SENSOR:
@@ -734,6 +795,8 @@ _Noreturn void app_main()
                 }
                 telemetry.wifi_connected = s_wifi_connected;
                 strlcpy(telemetry.wifi_ssid, (char *)ssid, sizeof(telemetry.wifi_ssid));
+                telemetry.mqtt_connected = s_mqtt_connected;
+                strlcpy(telemetry.mqtt_url, url, sizeof(telemetry.mqtt_url));
                 telemetry.heater_on = heater_on;
                 telemetry.heater_on_threshold_c = heater_on_threshold;
                 telemetry.heater_off_threshold_c = heater_off_threshold;

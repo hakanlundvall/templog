@@ -69,6 +69,24 @@ static float heater_off_threshold = 0;
 
 #define CONNECTION_RETRY_PERIOD_MS 60000
 
+/* How long to wait for the first Wi-Fi association before carrying on with the
+ * boot. Temperature logging and heater control must not depend on the network,
+ * and neither must the BLE command loop that lets the device be reconfigured. */
+#define WIFI_FIRST_CONNECT_TIMEOUT_MS 30000
+
+/* A device that has never been provisioned has no credentials in NVS. Rather
+ * than refusing to boot, it comes up with BLE running so that set_wifi and
+ * set_mqtt can supply them. */
+static bool has_wifi_config(void)
+{
+    return ssid[0] != '\0';
+}
+
+static bool has_mqtt_config(void)
+{
+    return url[0] != '\0';
+}
+
 static void log_error_if_nonzero(const char *message, int error_code)
 {
     if (error_code != 0)
@@ -82,7 +100,12 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
-        esp_wifi_connect();
+        /* Connecting with an empty SSID fails synchronously and raises no
+         * disconnect event, which would leave the boot wait hanging. */
+        if (has_wifi_config())
+        {
+            esp_wifi_connect();
+        }
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED)
     {
@@ -156,25 +179,31 @@ void wifi_init_sta(void)
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 
+    if (!has_wifi_config())
+    {
+        ESP_LOGW(TAG, "No Wi-Fi credentials stored; waiting for a set_wifi command over BLE");
+        return;
+    }
+
+    /* Bounded, so that an AP that never answers cannot hold up the rest of the
+     * boot; the connection monitor keeps retrying in the background either way. */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE,
                                            pdFALSE,
-                                           portMAX_DELAY);
+                                           pdMS_TO_TICKS(WIFI_FIRST_CONNECT_TIMEOUT_MS));
 
     if (bits & WIFI_CONNECTED_BIT)
     {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                 ssid, password);
+        ESP_LOGI(TAG, "connected to ap SSID:%s", ssid);
     }
     else if (bits & WIFI_FAIL_BIT)
     {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                 ssid, password);
+        ESP_LOGW(TAG, "Failed to connect to SSID:%s", ssid);
     }
     else
     {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        ESP_LOGW(TAG, "Timed out connecting to SSID:%s; continuing boot", ssid);
     }
 }
 
@@ -231,6 +260,12 @@ static esp_mqtt_client_handle_t mqtt_app_start(void)
     static char lwt_msg[] = "disconnected";
     static char connect_msg[] = "start";
     static char status_topic[] = "temp/1/status";
+    if (!has_mqtt_config())
+    {
+        ESP_LOGW(TAG, "No MQTT broker stored; waiting for a set_mqtt command over BLE");
+        return NULL;
+    }
+
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = url,
         .session.last_will.msg = lwt_msg,
@@ -240,8 +275,14 @@ static esp_mqtt_client_handle_t mqtt_app_start(void)
         .session.last_will.retain = 0,
         .session.keepalive = 9,
     };
+
     ESP_LOGI(TAG, "Starting MQTT client URL: %s", url);
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    if (client == NULL)
+    {
+        ESP_LOGE(TAG, "esp_mqtt_client_init failed for URL: %s", url);
+        return NULL;
+    }
     /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
@@ -251,13 +292,33 @@ static esp_mqtt_client_handle_t mqtt_app_start(void)
     return client;
 }
 
+/* Publishing is a no-op until a broker has been configured and the client
+ * created. An unprovisioned device still reads sensors and drives the heater. */
+static void mqtt_publish(const char *topic, const char *payload, int len)
+{
+    esp_mqtt_client_handle_t client = g_mqtt_client;
+    if (client == NULL)
+    {
+        return;
+    }
+    int msg_id = esp_mqtt_client_publish(client, topic, payload, len, 1, 0);
+    ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+}
+
 static void connection_monitor_task(void *arg)
 {
-    esp_mqtt_client_handle_t client = arg;
+    (void)arg;
 
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(CONNECTION_RETRY_PERIOD_MS));
+
+        /* An unprovisioned device has nothing to retry; it is simply waiting
+         * for credentials to arrive over BLE. */
+        if (!has_wifi_config())
+        {
+            continue;
+        }
 
         if (!s_wifi_connected)
         {
@@ -267,7 +328,10 @@ static void connection_monitor_task(void *arg)
             continue;
         }
 
-        if (!s_mqtt_connected)
+        /* Read the handle each time round: the client may not have existed at
+         * boot and been created later by a set_mqtt command. */
+        esp_mqtt_client_handle_t client = g_mqtt_client;
+        if (client != NULL && !s_mqtt_connected)
         {
             ESP_LOGW(TAG, "MQTT is disconnected; retrying connection");
             esp_err_t ret = esp_mqtt_client_reconnect(client);
@@ -333,8 +397,14 @@ static bool apply_mqtt_config(const char **error)
 {
     if (g_mqtt_client == NULL)
     {
-        *error = "MQTT client not started yet";
-        return false;
+        /* The device booted without a broker, so there is nothing to retarget;
+         * create the client now instead. */
+        if (mqtt_app_start() == NULL)
+        {
+            *error = "could not start the MQTT client";
+            return false;
+        }
+        return true;
     }
 
     esp_mqtt_client_stop(g_mqtt_client);
@@ -391,10 +461,14 @@ static void process_ble_commands(void)
             if (!apply_mqtt_config(&error))
             {
                 /* Keep NVS and the running client consistent: put the old
-                 * broker back rather than persisting one that will not start. */
-                const char *rollback_error = NULL;
+                 * broker back rather than persisting one that will not start.
+                 * A device that booted unprovisioned simply stays that way. */
                 strlcpy(url, previous, sizeof(url));
-                apply_mqtt_config(&rollback_error);
+                if (has_mqtt_config())
+                {
+                    const char *rollback_error = NULL;
+                    apply_mqtt_config(&rollback_error);
+                }
                 ble_service_report_status("set_mqtt", false, error);
                 break;
             }
@@ -522,32 +596,32 @@ _Noreturn void app_main()
     {
         printf("Done\n");
 
-        // Read
-        printf("Reading  from NVS ... ");
+        /* A value that has never been written leaves its buffer empty. The
+         * device then boots unconfigured with BLE advertising, so set_wifi and
+         * set_mqtt can provision it; rebooting instead would be a loop, because
+         * BLE never starts early enough to receive the commands that would fix
+         * it. */
         size_t length = sizeof(ssid);
         if (!read_value(my_handle, "SSID", ssid, &length))
         {
-            printf("Restarting now.\n");
-            fflush(stdout);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            esp_restart();
+            ssid[0] = '\0';
         }
-        // memcpy(ssid, "Grythem464", 11);
         length = sizeof(password);
         if (!read_value(my_handle, "PW", password, &length))
         {
-            printf("Restarting now.\n");
-            fflush(stdout);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            esp_restart();
+            password[0] = '\0';
         }
         length = sizeof(url);
         if (!read_value(my_handle, "MQTT", (uint8_t *)url, &length))
         {
-            printf("Restarting now.\n");
-            fflush(stdout);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            esp_restart();
+            url[0] = '\0';
+        }
+        if (!has_wifi_config() || !has_mqtt_config())
+        {
+            ESP_LOGW(TAG, "Device is not fully provisioned (wifi=%s, mqtt=%s); "
+                          "configure it over BLE",
+                     has_wifi_config() ? "set" : "missing",
+                     has_mqtt_config() ? "set" : "missing");
         }
 
         g_nvs_handle = my_handle;
@@ -571,8 +645,8 @@ _Noreturn void app_main()
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
-    esp_mqtt_client_handle_t client = mqtt_app_start();
-    xTaskCreate(connection_monitor_task, "connection_monitor", 4096, client, 5, NULL);
+    mqtt_app_start();
+    xTaskCreate(connection_monitor_task, "connection_monitor", 4096, NULL, 5, NULL);
     // Stable readings require a brief period before communication
     vTaskDelay(2000.0 / portTICK_PERIOD_MS);
 
@@ -834,8 +908,7 @@ _Noreturn void app_main()
                     snprintf(topic, 100, "temp/%s", rom_code_s);
                     if (len > 0)
                     {
-                        int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
-                        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+                        mqtt_publish(topic, buf, len);
                     }
                 }
                 if (publish_error)
@@ -844,8 +917,7 @@ _Noreturn void app_main()
                     snprintf(topic, 100, "temp/errors/%s", rom_code_s);
                     if (len > 0)
                     {
-                        int msg_id = esp_mqtt_client_publish(client, topic, buf, len, 1, 0);
-                        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+                        mqtt_publish(topic, buf, len);
                     }
                 }
             }

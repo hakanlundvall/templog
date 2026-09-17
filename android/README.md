@@ -25,6 +25,13 @@ Bluetooth Low Energy, shows live telemetry, and sends the same set of commands.
 * **Survives a bad link.** Disconnects re-enter the connect loop with
   exponential backoff (1s doubling to 30s), matching the Pi service.
 
+## Provisioning a fresh device
+
+A device with nothing in NVS still advertises and accepts commands; it simply
+has no network. The app shows an empty SSID and "no broker configured", and the
+*Change credentials* and *Change broker URL* dialogs finish the setup. Both
+apply immediately and persist on the device.
+
 ## Protocol notes
 
 The firmware sends a fixed one byte payload for *both* notify

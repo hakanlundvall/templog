@@ -7,9 +7,11 @@ over Bluetooth Low Energy (BLE), robust against flaky BLE connectivity.
 
 * The ESP32 advertises as `templog` and exposes a custom GATT service with:
   * a **telemetry** characteristic (read + notify) — temperatures (with age),
-    Wi-Fi connection state + SSID, heater on/off,
-  * a **command** characteristic (write) — set Wi-Fi, choose water sensor,
-    set heater thresholds, force heater off, start heater,
+    Wi-Fi connection state + SSID, MQTT broker URL + connection state,
+    heater on/off,
+  * a **command** characteristic (write) — set Wi-Fi, set the MQTT broker,
+    choose water sensor, set heater thresholds, force heater off, start
+    heater,
   * a **status** characteristic (read + notify) — result of the last command.
 * The link is encrypted and bonded (NimBLE "Just Works" pairing + LE Secure
   Connections). Bonds are stored in the ESP32's flash (NVS), so re-pairing is
@@ -65,6 +67,8 @@ templogctl status
 
 templogctl set-wifi "MyHomeSSID" "supersecret"
 
+templogctl set-mqtt mqtt://192.168.2.10:1883
+
 templogctl set-water-sensor 28ff640000000000
 
 templogctl set-thresholds --on 60 --off 80
@@ -86,6 +90,7 @@ templogctl heater-on                  # starts heater unless water temp already 
       {"id": "28aa550000000000", "c": 21.4, "age": 1200, "water": false}
     ],
     "wifi": {"c": true, "ssid": "MyHomeSSID"},
+    "mqtt": {"c": true, "url": "mqtt://192.168.2.10:1883"},
     "heater": true,
     "onC": 60.0,
     "offC": 80.0,
@@ -99,6 +104,10 @@ means the sensor has never produced a valid reading. `onC`/`offC` are the
 current heater thresholds and `forceState` is `0` (automatic), `1` (forced
 off until start conditions are met again) or `2` (forced off until
 explicitly started).
+
+`set-mqtt` restarts the ESP32's MQTT client against the new broker straight
+away and only persists the URL once the client accepts it, so a URL the client
+refuses to start on leaves the previous broker in place.
 
 ## Security notes
 

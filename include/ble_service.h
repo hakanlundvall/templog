@@ -11,6 +11,7 @@ extern "C" {
 
 #define BLE_MAX_TEMP_SENSORS 8
 #define BLE_ROM_CODE_HEX_LEN 16 /* 8 bytes -> 16 hex chars, plus NUL */
+#define BLE_MQTT_URL_LEN 100    /* matches the broker URL buffer in main.c */
 
 /* One temperature reading reported to the Raspberry Pi. */
 typedef struct {
@@ -27,6 +28,8 @@ typedef struct {
     int num_readings;
     bool wifi_connected;
     char wifi_ssid[33];
+    bool mqtt_connected;
+    char mqtt_url[BLE_MQTT_URL_LEN];
     bool heater_on;
     float heater_on_threshold_c;
     float heater_off_threshold_c;
@@ -36,6 +39,7 @@ typedef struct {
 
 typedef enum {
     BLE_CMD_SET_WIFI,
+    BLE_CMD_SET_MQTT,
     BLE_CMD_SET_WATER_SENSOR,
     BLE_CMD_SET_THRESHOLDS,
     BLE_CMD_HEATER_FORCE_OFF,
@@ -55,6 +59,9 @@ typedef struct {
             char ssid[33];
             char password[65];
         } wifi;
+        struct {
+            char url[BLE_MQTT_URL_LEN];
+        } mqtt;
         struct {
             char rom_code_hex[BLE_ROM_CODE_HEX_LEN + 1];
         } water_sensor;

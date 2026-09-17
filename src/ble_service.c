@@ -34,7 +34,12 @@ static const ble_uuid128_t CHR_STATUS_UUID =
     BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
                       0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
 
-#define MAX_JSON_LEN 768
+/* Sized separately: telemetry is by far the largest document, while an
+ * incoming command is at most a Wi-Fi or broker URL payload. Keeping the
+ * command buffer small matters because it lives on the NimBLE host stack. */
+#define MAX_TELEMETRY_JSON_LEN 1024
+#define MAX_STATUS_JSON_LEN 256
+#define MAX_CMD_JSON_LEN 512
 
 static QueueHandle_t s_command_queue;
 static SemaphoreHandle_t s_state_mutex;
@@ -45,9 +50,9 @@ static uint16_t s_status_val_handle;
 static bool s_telemetry_subscribed;
 static bool s_status_subscribed;
 
-static char s_telemetry_json[MAX_JSON_LEN];
+static char s_telemetry_json[MAX_TELEMETRY_JSON_LEN];
 static size_t s_telemetry_json_len;
-static char s_status_json[MAX_JSON_LEN];
+static char s_status_json[MAX_STATUS_JSON_LEN];
 static size_t s_status_json_len;
 
 static uint8_t s_own_addr_type;
@@ -135,6 +140,18 @@ static void handle_command_json(const char *json, size_t len)
             strlcpy(out.data.wifi.ssid, ssid->valuestring, sizeof(out.data.wifi.ssid));
             strlcpy(out.data.wifi.password, pw->valuestring, sizeof(out.data.wifi.password));
         }
+    } else if (strcmp(cmd, "set_mqtt") == 0) {
+        const cJSON *url = cJSON_GetObjectItemCaseSensitive(root, "url");
+        if (!cJSON_IsString(url) || url->valuestring[0] == '\0') {
+            ok = false;
+            error = "url required";
+        } else if (strlen(url->valuestring) >= BLE_MQTT_URL_LEN) {
+            ok = false;
+            error = "url too long";
+        } else {
+            out.type = BLE_CMD_SET_MQTT;
+            strlcpy(out.data.mqtt.url, url->valuestring, sizeof(out.data.mqtt.url));
+        }
     } else if (strcmp(cmd, "set_water_sensor") == 0) {
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
         if (!cJSON_IsString(id)) {
@@ -216,10 +233,10 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
             return BLE_ATT_ERR_UNLIKELY;
         }
         uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-        if (len == 0 || len >= MAX_JSON_LEN) {
+        if (len == 0 || len >= MAX_CMD_JSON_LEN) {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
-        char buf[MAX_JSON_LEN];
+        char buf[MAX_CMD_JSON_LEN];
         int rc = ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf) - 1, &len);
         if (rc != 0) {
             return BLE_ATT_ERR_UNLIKELY;
@@ -404,6 +421,9 @@ void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
     cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
     cJSON_AddBoolToObject(wifi, "c", telemetry->wifi_connected);
     cJSON_AddStringToObject(wifi, "ssid", telemetry->wifi_ssid);
+    cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
+    cJSON_AddBoolToObject(mqtt, "c", telemetry->mqtt_connected);
+    cJSON_AddStringToObject(mqtt, "url", telemetry->mqtt_url);
     cJSON_AddBoolToObject(root, "heater", telemetry->heater_on);
     cJSON_AddNumberToObject(root, "onC", telemetry->heater_on_threshold_c);
     cJSON_AddNumberToObject(root, "offC", telemetry->heater_off_threshold_c);

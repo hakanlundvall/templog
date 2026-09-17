@@ -32,6 +32,7 @@ object Protocol {
     val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     const val CMD_SET_WIFI = "set_wifi"
+    const val CMD_SET_MQTT = "set_mqtt"
     const val CMD_SET_WATER_SENSOR = "set_water_sensor"
     const val CMD_SET_THRESHOLDS = "set_thresholds"
     const val CMD_HEATER_OFF = "heater_off"
@@ -45,6 +46,11 @@ object Protocol {
             .put("cmd", CMD_SET_WIFI)
             .put("ssid", ssid)
             .put("password", password)
+
+    fun setMqtt(url: String): JSONObject =
+        JSONObject()
+            .put("cmd", CMD_SET_MQTT)
+            .put("url", url)
 
     fun setWaterSensor(romCodeHex: String): JSONObject =
         JSONObject()
@@ -105,6 +111,8 @@ data class Telemetry(
     val sensors: List<SensorReading>,
     val wifiConnected: Boolean,
     val wifiSsid: String,
+    val mqttConnected: Boolean,
+    val mqttUrl: String,
     val heaterOn: Boolean,
     val heaterOnThresholdC: Double,
     val heaterOffThresholdC: Double,
@@ -131,10 +139,13 @@ data class Telemetry(
                 }
             }
             val wifi = root.optJSONObject("wifi")
+            val mqtt = root.optJSONObject("mqtt")
             return Telemetry(
                 sensors = sensors,
                 wifiConnected = wifi?.optBoolean("c", false) ?: false,
                 wifiSsid = wifi?.optString("ssid").orEmpty(),
+                mqttConnected = mqtt?.optBoolean("c", false) ?: false,
+                mqttUrl = mqtt?.optString("url").orEmpty(),
                 heaterOn = root.optBoolean("heater", false),
                 heaterOnThresholdC = root.optDouble("onC", Double.NaN),
                 heaterOffThresholdC = root.optDouble("offC", Double.NaN),

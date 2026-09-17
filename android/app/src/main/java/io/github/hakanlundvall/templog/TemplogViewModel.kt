@@ -50,6 +50,8 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
     fun setWifi(ssid: String, password: String) =
         issue("Wi-Fi credentials updated", Protocol.setWifi(ssid, password))
 
+    fun setMqtt(url: String) = issue("MQTT broker set to $url", Protocol.setMqtt(url))
+
     fun setWaterSensor(romCodeHex: String) =
         issue("Water sensor set to $romCodeHex", Protocol.setWaterSensor(romCodeHex))
 

@@ -24,6 +24,7 @@ STATUS_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 # Commands (sent as JSON on COMMAND_CHAR_UUID)
 CMD_SET_WIFI = "set_wifi"
+CMD_SET_MQTT = "set_mqtt"
 CMD_SET_WATER_SENSOR = "set_water_sensor"
 CMD_SET_THRESHOLDS = "set_thresholds"
 CMD_HEATER_OFF = "heater_off"

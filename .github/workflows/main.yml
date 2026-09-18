@@ -14,10 +14,6 @@ jobs:
             ~/.cache/pip
             ~/.platformio/.cache
           key: ${{ runner.os }}-pio
-      - name: Setup Node.js environment
-        uses: actions/setup-node@v5
-        with:
-          node-version: '24'
       - uses: actions/setup-python@v6
         with:
           python-version: '3.9'
@@ -31,8 +27,3 @@ jobs:
         with:
           name: firmware
           path: .pio/build/featheresp32/firmware.bin
-      - name: HTTP Push
-        run: node http-push.js
-        env:
-          COMMIT_HASH: ${{ github.sha }}
-          GITHUB_RUN_ID: ${{ github.run_id }}

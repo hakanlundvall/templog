@@ -59,7 +59,11 @@ push that touches `android/`. Each run uploads two artifacts:
 | Artifact | Build | Use it for |
 | --- | --- | --- |
 | `templog-app-release` | `app-release.apk` | Installing on a phone |
-| `templog-app-debug` | `app-debug.apk` | Debugging with a attached tooling |
+| `templog-app-debug` | `app-debug.apk` | Debugging with attached tooling |
+
+The release artifact also carries R8's `mapping.txt`, which is what turns an
+obfuscated stack trace back into readable class and method names. Keep the copy
+that matches whatever build is installed.
 
 Install with `adb install -r app-release.apk`.
 
@@ -68,8 +72,8 @@ keystore, and a CI runner has no persistent one, so *every run produces a
 different signing key*. Android refuses to update an installed app across a key
 change, so each debug build has to be uninstalled before the next can go on.
 Release builds are signed with a fixed key and update in place. The release
-build is also not debuggable and runs through R8, which shrinks it to roughly a
-third of the debug size.
+build is also not debuggable and runs through R8 with resource shrinking, which
+takes it from around 9.5 MB to a little over 1 MB.
 
 ### Release signing
 

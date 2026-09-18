@@ -17,6 +17,13 @@ jobs:
     defaults:
       run:
         working-directory: android
+    # At job level so that the release steps can test it in an `if:`; a step's
+    # own `env:` block is not visible to its own condition.
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
     steps:
       - uses: actions/checkout@v5
@@ -38,6 +45,27 @@ jobs:
         with:
           name: templog-app-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      # Signing material is only available to runs on this repository, so a
+      # pull request from a fork still builds a (unsigned) release APK.
+      - name: Decode release keystore
+        if: env.ANDROID_KEYSTORE_BASE64 != ''
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: templog-app-release
+          path: android/app/build/outputs/apk/release/app-release*.apk
+
+      - name: Remove release keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
 
       - name: Lint
         run: ./gradlew --no-daemon lintDebug

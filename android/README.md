@@ -52,10 +52,44 @@ just as much as for telemetry. `Protocol.kt` mirrors
 
 ## Building
 
-The APK is built by GitHub Actions
+The APKs are built by GitHub Actions
 ([`.github/workflows/android.yml`](../.github/workflows/android.yml)) on every
-push that touches `android/`. Download it from the run's **templog-app-debug**
-artifact and install with `adb install app-debug.apk`.
+push that touches `android/`. Each run uploads two artifacts:
+
+| Artifact | Build | Use it for |
+| --- | --- | --- |
+| `templog-app-release` | `app-release.apk` | Installing on a phone |
+| `templog-app-debug` | `app-debug.apk` | Debugging with a attached tooling |
+
+Install with `adb install -r app-release.apk`.
+
+**Prefer the release APK.** Debug builds are signed with AGP's throwaway debug
+keystore, and a CI runner has no persistent one, so *every run produces a
+different signing key*. Android refuses to update an installed app across a key
+change, so each debug build has to be uninstalled before the next can go on.
+Release builds are signed with a fixed key and update in place. The release
+build is also not debuggable and runs through R8, which shrinks it to roughly a
+third of the debug size.
+
+### Release signing
+
+The keystore is never committed — this repository is public. The build reads it
+from the environment, and produces an unsigned APK when it is absent:
+
+| Variable | GitHub Actions secret |
+| --- | --- |
+| `ANDROID_KEYSTORE_PATH` | derived from `ANDROID_KEYSTORE_BASE64` by the workflow |
+| `ANDROID_KEYSTORE_PASSWORD` | `ANDROID_KEYSTORE_PASSWORD` |
+| `ANDROID_KEY_ALIAS` | `ANDROID_KEY_ALIAS` |
+| `ANDROID_KEY_PASSWORD` | `ANDROID_KEY_PASSWORD` |
+
+To build a signed release locally, export the same four variables and run
+`./gradlew assembleRelease`. The keystore is a PKCS12 file, which uses a single
+password for both the store and the key.
+
+> Back the keystore up. Losing it does not cost any app data — the BLE bond
+> lives in Android's Bluetooth settings, not in the app — but every phone with
+> the app installed would have to uninstall before taking another update.
 
 To build locally, use the dev container in
 [`../.devcontainer/android`](../.devcontainer/android) (VS Code: *Dev

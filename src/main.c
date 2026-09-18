@@ -353,6 +353,13 @@ static void connection_monitor_task(void *arg)
 #define HEATER_ON_THRESHOLD 60.0f
 #define TEMP_READING_TIMEOUT_MS 60000
 
+/* Per-sensor history. At file scope because telemetry is published both from
+ * the sampling loop and from the idle loop that runs when no sensor was
+ * found at boot. */
+static TickType_t last_good_reading[MAX_DEVICES];
+static bool ever_good[MAX_DEVICES];
+static float last_good_value[MAX_DEVICES];
+
 bool read_value(nvs_handle_t handle, const char *key, uint8_t *value, size_t *length)
 {
     printf("Reading  from NVS ... ");
@@ -553,6 +560,32 @@ static void process_ble_commands(void)
     }
 }
 
+static void publish_telemetry(void)
+{
+    ble_telemetry_t telemetry = {0};
+    telemetry.num_readings = num_devices < BLE_MAX_TEMP_SENSORS ? num_devices : BLE_MAX_TEMP_SENSORS;
+    for (int i = 0; i < telemetry.num_readings; ++i)
+    {
+        owb_string_from_rom_code(device_rom_codes[i], telemetry.readings[i].rom_code_hex,
+                                  sizeof(telemetry.readings[i].rom_code_hex));
+        telemetry.readings[i].valid = ever_good[i];
+        telemetry.readings[i].value_c = last_good_value[i];
+        telemetry.readings[i].age_ms = ever_good[i]
+                                            ? (uint32_t)((xTaskGetTickCount() - last_good_reading[i]) * portTICK_PERIOD_MS)
+                                            : UINT32_MAX;
+        telemetry.readings[i].is_water_sensor = (i == water_sensor_index);
+    }
+    telemetry.wifi_connected = s_wifi_connected;
+    strlcpy(telemetry.wifi_ssid, (char *)ssid, sizeof(telemetry.wifi_ssid));
+    telemetry.mqtt_connected = s_mqtt_connected;
+    strlcpy(telemetry.mqtt_url, url, sizeof(telemetry.mqtt_url));
+    telemetry.heater_on = heater_on;
+    telemetry.heater_on_threshold_c = heater_on_threshold;
+    telemetry.heater_off_threshold_c = heater_off_threshold;
+    telemetry.heater_force_state = (int)heater_force_state;
+    ble_service_update_telemetry(&telemetry);
+}
+
 _Noreturn void app_main()
 {
     // Override global log level
@@ -667,9 +700,6 @@ _Noreturn void app_main()
     int count = 0;
     bool has_good_temp_reading = false;
     TickType_t last_good_temp_reading = 0;
-    TickType_t last_good_reading[MAX_DEVICES] = {0};
-    bool ever_good[MAX_DEVICES] = {0};
-    float last_good_value[MAX_DEVICES] = {0};
     OneWireBus_SearchState search_state = {0};
     bool found = false;
     owb_search_first(owb, &search_state, &found);
@@ -853,30 +883,7 @@ _Noreturn void app_main()
             }
             gpio_set_level(GPIO_HEATER, heater_on);
 
-            {
-                ble_telemetry_t telemetry = {0};
-                telemetry.num_readings = num_devices < BLE_MAX_TEMP_SENSORS ? num_devices : BLE_MAX_TEMP_SENSORS;
-                for (int i = 0; i < telemetry.num_readings; ++i)
-                {
-                    owb_string_from_rom_code(device_rom_codes[i], telemetry.readings[i].rom_code_hex,
-                                              sizeof(telemetry.readings[i].rom_code_hex));
-                    telemetry.readings[i].valid = ever_good[i];
-                    telemetry.readings[i].value_c = last_good_value[i];
-                    telemetry.readings[i].age_ms = ever_good[i]
-                                                        ? (uint32_t)((xTaskGetTickCount() - last_good_reading[i]) * portTICK_PERIOD_MS)
-                                                        : UINT32_MAX;
-                    telemetry.readings[i].is_water_sensor = (i == water_sensor_index);
-                }
-                telemetry.wifi_connected = s_wifi_connected;
-                strlcpy(telemetry.wifi_ssid, (char *)ssid, sizeof(telemetry.wifi_ssid));
-                telemetry.mqtt_connected = s_mqtt_connected;
-                strlcpy(telemetry.mqtt_url, url, sizeof(telemetry.mqtt_url));
-                telemetry.heater_on = heater_on;
-                telemetry.heater_on_threshold_c = heater_on_threshold;
-                telemetry.heater_off_threshold_c = heater_off_threshold;
-                telemetry.heater_force_state = (int)heater_force_state;
-                ble_service_update_telemetry(&telemetry);
-            }
+            publish_telemetry();
 
             // Print results in a separate loop, after all have been read
             printf("\nTemperature readings (degrees C): sample %d\n", ++sample_count);
@@ -935,13 +942,30 @@ _Noreturn void app_main()
         printf("\nNo DS18B20 devices detected!\n");
     }
 
+    /* Reached only when the 1-Wire search found nothing. BLE still has to be
+     * serviced here, otherwise the device would advertise and accept writes
+     * while silently ignoring every command - which would make an unprovisioned
+     * board with no sensors wired impossible to configure. */
     while (1)
     {
-        level = level ? 0 : 1;
+        process_ble_commands();
+
+        /* Same interlock the sampling loop applies when readings go stale:
+         * with no temperature to judge by, the heater must never run, so a
+         * heater_on command is accepted and then immediately overridden. */
+        if (heater_on)
+        {
+            ESP_LOGW(TAG, "No temperature sensors; refusing to run the heater");
+            heater_on = false;
+        }
         gpio_set_level(GPIO_HEATER, heater_on);
+
+        publish_telemetry();
+
+        level = level ? 0 : 1;
         gpio_set_level(GPIO_NUM_18, level2);
         gpio_set_level(GPIO_NUM_19, !level);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        vTaskDelay(SAMPLE_PERIOD / portTICK_PERIOD_MS);
     }
 
     // clean up dynamically allocated data

@@ -61,7 +61,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: templog-app-release
-          path: android/app/build/outputs/apk/release/app-release*.apk
+          path: |
+            android/app/build/outputs/apk/release/app-release*.apk
+            android/app/build/outputs/mapping/release/mapping.txt
 
       - name: Remove release keystore
         if: always()

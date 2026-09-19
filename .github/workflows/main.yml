@@ -5,9 +5,16 @@ on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Creating a GitHub Release for a v* tag needs write access to contents.
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history and tags, so `git describe` gives the firmware a
+          # meaningful version on untagged builds.
+          fetch-depth: 0
       - uses: actions/cache@v4
         with:
           path: |
@@ -22,8 +29,40 @@ jobs:
         
       - name: Build PlatformIO Project
         run: pio run
+        env:
+          # A release build carries exactly its tag as version, which is what
+          # the device compares against when asked to update.
+          FW_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+
+      - name: Show embedded firmware version
+        run: |
+          python3 - <<'PY'
+          import struct, sys
+          data = open(".pio/build/featheresp32/firmware.bin", "rb").read()
+          # esp_app_desc_t follows the image header and the first segment header.
+          magic, = struct.unpack_from("<I", data, 0x20)
+          if magic != 0xABCD5432:
+              sys.exit("app description not found in firmware.bin")
+          version = data[0x30:0x50].split(b"\0")[0].decode()
+          print(f"Firmware version: {version}")
+          print(f"Image size: {len(data)} bytes")
+          ref = "${{ github.ref }}"
+          if ref.startswith("refs/tags/v") and version != "${{ github.ref_name }}":
+              sys.exit(f"embedded version {version!r} does not match the tag")
+          PY
+
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
           name: firmware
           path: .pio/build/featheresp32/firmware.bin
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          .pio/build/featheresp32/firmware.bin
+          --title "${{ github.ref_name }}"
+          --generate-notes

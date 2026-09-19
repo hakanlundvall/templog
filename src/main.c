@@ -47,6 +47,12 @@ static int s_retry_num = 0;
 static uint32_t level2 = 0;
 static volatile bool s_wifi_connected = false;
 static volatile bool s_mqtt_connected = false;
+/* Written by the Wi-Fi event handler, read when building telemetry, so the
+ * cause of a dropped link can be seen over BLE without a serial console. */
+static volatile uint32_t s_wifi_disconnect_count = 0;
+static volatile uint8_t s_wifi_last_disc_reason = 0;
+static volatile int8_t s_wifi_last_disc_rssi = 0;
+static volatile TickType_t s_wifi_last_disc_tick = 0;
 static esp_mqtt_client_handle_t g_mqtt_client = NULL;
 
 typedef enum {
@@ -113,7 +119,13 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
+        wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
         s_wifi_connected = false;
+        s_wifi_last_disc_reason = event->reason;
+        s_wifi_last_disc_rssi = event->rssi;
+        s_wifi_last_disc_tick = xTaskGetTickCount();
+        s_wifi_disconnect_count++;
+        ESP_LOGW(TAG, "Wi-Fi disconnected, reason %d, rssi %d", event->reason, event->rssi);
         level2 = 1;
         if (s_retry_num < MAXIMUM_RETRY)
         {
@@ -577,6 +589,18 @@ static void publish_telemetry(void)
     }
     telemetry.wifi_connected = s_wifi_connected;
     strlcpy(telemetry.wifi_ssid, (char *)ssid, sizeof(telemetry.wifi_ssid));
+    wifi_ap_record_t ap_info;
+    if (s_wifi_connected && esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+    {
+        telemetry.wifi_rssi_valid = true;
+        telemetry.wifi_rssi = ap_info.rssi;
+    }
+    telemetry.wifi_disconnect_count = s_wifi_disconnect_count;
+    telemetry.wifi_last_disc_reason = s_wifi_last_disc_reason;
+    telemetry.wifi_last_disc_rssi = s_wifi_last_disc_rssi;
+    telemetry.wifi_last_disc_age_ms = s_wifi_disconnect_count > 0
+                                          ? (uint32_t)((xTaskGetTickCount() - s_wifi_last_disc_tick) * portTICK_PERIOD_MS)
+                                          : UINT32_MAX;
     telemetry.mqtt_connected = s_mqtt_connected;
     strlcpy(telemetry.mqtt_url, url, sizeof(telemetry.mqtt_url));
     telemetry.heater_on = heater_on;

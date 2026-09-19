@@ -76,6 +76,9 @@ templogctl set-thresholds --on 60 --off 80
 templogctl heater-off                 # resumes automatically once temp drops to/below the on-threshold
 templogctl heater-off --until-started # stays off until an explicit heater-on
 templogctl heater-on                  # starts heater unless water temp already >= off-threshold
+
+templogctl ota-update                 # install the latest GitHub release over the ESP32's Wi-Fi
+templogctl ota-update --tag v1.2.0    # install a specific release
 ```
 
 `templogctl status` prints the latest telemetry snapshot, e.g.:
@@ -94,7 +97,9 @@ templogctl heater-on                  # starts heater unless water temp already 
     "heater": true,
     "onC": 60.0,
     "offC": 80.0,
-    "forceState": 0
+    "forceState": 0,
+    "fw": "v1.2.0",
+    "ota": {"state": "idle"}
   }
 }
 ```
@@ -104,6 +109,13 @@ means the sensor has never produced a valid reading. `onC`/`offC` are the
 current heater thresholds and `forceState` is `0` (automatic), `1` (forced
 off until start conditions are met again) or `2` (forced off until
 explicitly started).
+
+`fw` is the version of the running firmware. `ota` describes a firmware
+update: `state` is one of `idle`, `downloading` (with `pct` progress),
+`rebooting`, `uptodate` (the release is the version already running),
+`failed` (with `err`) or `verifying` (a freshly installed image that is
+rolled back unless it reaches Wi-Fi within two minutes). `ver` is the
+version being installed once known.
 
 `set-mqtt` restarts the ESP32's MQTT client against the new broker straight
 away and only persists the URL once the client accepts it, so a URL the client

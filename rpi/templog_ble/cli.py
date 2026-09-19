@@ -70,6 +70,10 @@ def cmd_heater_on(args: argparse.Namespace) -> None:
     _issue_command(args, {"cmd": protocol.CMD_HEATER_ON})
 
 
+def cmd_ota_update(args: argparse.Namespace) -> None:
+    _issue_command(args, {"cmd": protocol.CMD_OTA_UPDATE, "tag": args.tag, "force": args.force})
+
+
 def _issue_command(args: argparse.Namespace, command: dict) -> None:
     resp = _run(args.socket, {"action": "command", "command": command})
     print(json.dumps(resp, indent=2))
@@ -113,6 +117,11 @@ def main() -> None:
 
     p = sub.add_parser("heater-on", help="Start the heater (unless water temperature is already above the off threshold)")
     p.set_defaults(func=cmd_heater_on)
+
+    p = sub.add_parser("ota-update", help="Have the ESP32 download and install a firmware release from GitHub")
+    p.add_argument("--tag", default="latest", help="Release tag to install, e.g. v1.2.0 (default: latest)")
+    p.add_argument("--force", action="store_true", help="Install even if the device already runs that version")
+    p.set_defaults(func=cmd_ota_update)
 
     args = parser.parse_args()
     args.func(args)

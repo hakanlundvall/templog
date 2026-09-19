@@ -47,9 +47,11 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.hakanlundvall.templog.ReleaseCheck
 import io.github.hakanlundvall.templog.TemplogViewModel
 import io.github.hakanlundvall.templog.ble.ConnectionState
 import io.github.hakanlundvall.templog.ble.HeaterForceState
+import io.github.hakanlundvall.templog.ble.OtaState
 import io.github.hakanlundvall.templog.ble.SensorReading
 import io.github.hakanlundvall.templog.ble.Telemetry
 import java.util.Locale
@@ -66,6 +68,7 @@ fun TemplogScreen(
     val address by viewModel.deviceAddress.collectAsStateWithLifecycle()
     val error by viewModel.lastError.collectAsStateWithLifecycle()
     val busy by viewModel.busy.collectAsStateWithLifecycle()
+    val releaseCheck by viewModel.releaseCheck.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(Unit) {
@@ -136,6 +139,15 @@ fun TemplogScreen(
                         )
                     }
                     item {
+                        FirmwareCard(
+                            telemetry = snapshot,
+                            releaseCheck = releaseCheck,
+                            enabled = state == ConnectionState.READY && !busy,
+                            onCheck = viewModel::checkForFirmwareUpdate,
+                            onInstall = { tag -> dialog = Dialog.Firmware(tag) },
+                        )
+                    }
+                    item {
                         Text(
                             "Temperature sensors",
                             style = MaterialTheme.typography.titleMedium,
@@ -160,7 +172,7 @@ fun TemplogScreen(
         }
     }
 
-    when (dialog) {
+    when (val current = dialog) {
         Dialog.Wifi -> WifiDialog(
             onDismiss = { dialog = null },
             onConfirm = { ssid, password ->
@@ -188,11 +200,26 @@ fun TemplogScreen(
             },
         )
 
+        is Dialog.Firmware -> FirmwareDialog(
+            tag = current.tag,
+            installed = telemetry?.firmwareVersion,
+            onDismiss = { dialog = null },
+            onConfirm = {
+                dialog = null
+                viewModel.installFirmware(current.tag)
+            },
+        )
+
         null -> Unit
     }
 }
 
-private enum class Dialog { Wifi, Mqtt, Thresholds }
+private sealed interface Dialog {
+    data object Wifi : Dialog
+    data object Mqtt : Dialog
+    data object Thresholds : Dialog
+    data class Firmware(val tag: String) : Dialog
+}
 
 @Composable
 private fun ConnectionCard(
@@ -445,6 +472,134 @@ private fun MqttDialog(
         confirmButton = {
             TextButton(onClick = { onConfirm(trimmed) }, enabled = valid) { Text("Apply") }
         },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun FirmwareCard(
+    telemetry: Telemetry,
+    releaseCheck: ReleaseCheck,
+    enabled: Boolean,
+    onCheck: () -> Unit,
+    onInstall: (String) -> Unit,
+) {
+    val installed = telemetry.firmwareVersion
+    val ota = telemetry.ota
+    val latest = (releaseCheck as? ReleaseCheck.Found)?.release
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Firmware", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Installed: " + (installed ?: "unknown"),
+                style = MaterialTheme.typography.bodyMedium,
+                fontFamily = FontFamily.Monospace,
+            )
+            Text(
+                when (releaseCheck) {
+                    ReleaseCheck.NotChecked -> "Latest release: not checked"
+                    ReleaseCheck.Checking -> "Latest release: checking…"
+                    ReleaseCheck.NoReleases -> "Latest release: none published"
+                    is ReleaseCheck.Found -> "Latest release: ${releaseCheck.release.tag}" +
+                        if (releaseCheck.release.tag == installed) " (installed)" else ""
+                    is ReleaseCheck.Failed -> "Latest release: check failed, ${releaseCheck.reason}"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = if (releaseCheck is ReleaseCheck.Failed) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+
+            if (ota != null) {
+                val target = ota.version?.let { " $it" }.orEmpty()
+                when (ota.state) {
+                    OtaState.DOWNLOADING -> {
+                        Text(
+                            "Downloading$target" + (ota.percent?.let { " – $it %" } ?: "…"),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        val percent = ota.percent
+                        if (percent != null) {
+                            LinearProgressIndicator(
+                                progress = { percent / 100f },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        } else {
+                            LinearProgressIndicator(Modifier.fillMaxWidth())
+                        }
+                    }
+                    OtaState.REBOOTING -> Text(
+                        "Installed$target, restarting…",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    OtaState.VERIFYING -> Text(
+                        "New firmware is running but not confirmed yet. It rolls back if it " +
+                            "cannot reach Wi-Fi.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    OtaState.UP_TO_DATE -> Text(
+                        "Already running$target, nothing installed.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    OtaState.FAILED -> Text(
+                        "Update failed: " + (ota.error ?: "unknown error"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    OtaState.IDLE, OtaState.UNKNOWN -> Unit
+                }
+            } else if (installed == null) {
+                Text(
+                    "This firmware does not support updates over the air; flash it over USB once.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = onCheck,
+                    enabled = releaseCheck != ReleaseCheck.Checking,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Check") }
+                FilledTonalButton(
+                    onClick = { latest?.let { onInstall(it.tag) } },
+                    enabled = enabled && latest != null && ota != null && !ota.inProgress &&
+                        ota.state != OtaState.VERIFYING && latest.tag != installed,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(
+                        if (latest != null && latest.tag == installed) "Up to date" else "Install",
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FirmwareDialog(
+    tag: String,
+    installed: String?,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Install firmware $tag?") },
+        text = {
+            Text(
+                "The device downloads $tag from GitHub over its own Wi-Fi" +
+                    (installed?.let { ", replacing $it," } ?: "") +
+                    " and then restarts. The heater is off for the few seconds the " +
+                    "restart takes. If the new firmware cannot reach Wi-Fi within two " +
+                    "minutes, the device goes back to the current version.",
+            )
+        },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("Install") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }

@@ -7,13 +7,17 @@ import io.github.hakanlundvall.templog.ble.CommandException
 import io.github.hakanlundvall.templog.ble.ConnectionState
 import io.github.hakanlundvall.templog.ble.Protocol
 import io.github.hakanlundvall.templog.ble.TemplogBleClient
+import io.github.hakanlundvall.templog.update.FirmwareRelease
+import io.github.hakanlundvall.templog.update.FirmwareReleases
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import org.json.JSONException
 import org.json.JSONObject
+import java.io.IOException
 
 /**
  * Owns the BLE client and turns UI intents into commands, serialising them so
@@ -35,6 +39,15 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
 
     /** One-shot user facing results of commands, rendered as a snackbar. */
     val messages = _messages.receiveAsFlow()
+
+    private val _releaseCheck = MutableStateFlow<ReleaseCheck>(ReleaseCheck.NotChecked)
+
+    /** What is known about the newest firmware release on GitHub. */
+    val releaseCheck: StateFlow<ReleaseCheck> = _releaseCheck.asStateFlow()
+
+    init {
+        checkForFirmwareUpdate()
+    }
 
     /** Called once the Bluetooth runtime permissions have been granted. */
     fun onPermissionsGranted() = client.start()
@@ -65,6 +78,27 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
 
     fun heaterOn() = issue("Heater started", Protocol.heaterOn())
 
+    fun checkForFirmwareUpdate() {
+        if (_releaseCheck.value == ReleaseCheck.Checking) return
+        _releaseCheck.value = ReleaseCheck.Checking
+        viewModelScope.launch {
+            _releaseCheck.value = try {
+                FirmwareReleases.latest()?.let { ReleaseCheck.Found(it) } ?: ReleaseCheck.NoReleases
+            } catch (e: IOException) {
+                ReleaseCheck.Failed(e.message ?: "network error")
+            } catch (e: JSONException) {
+                ReleaseCheck.Failed("unexpected reply from GitHub")
+            }
+        }
+    }
+
+    /**
+     * Tells the device to download and install [tag] itself. Progress arrives
+     * through telemetry; the device then restarts and the client reconnects.
+     */
+    fun installFirmware(tag: String) =
+        issue("Firmware update to $tag started", Protocol.otaUpdate(tag))
+
     private fun issue(successMessage: String, command: JSONObject) {
         if (_busy.value) {
             _messages.trySend("Another command is still running")
@@ -90,4 +124,12 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
         client.stop()
         super.onCleared()
     }
+}
+
+sealed interface ReleaseCheck {
+    data object NotChecked : ReleaseCheck
+    data object Checking : ReleaseCheck
+    data object NoReleases : ReleaseCheck
+    data class Found(val release: FirmwareRelease) : ReleaseCheck
+    data class Failed(val reason: String) : ReleaseCheck
 }

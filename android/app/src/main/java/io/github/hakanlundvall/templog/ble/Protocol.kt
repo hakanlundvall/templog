@@ -37,6 +37,7 @@ object Protocol {
     const val CMD_SET_THRESHOLDS = "set_thresholds"
     const val CMD_HEATER_OFF = "heater_off"
     const val CMD_HEATER_ON = "heater_on"
+    const val CMD_OTA_UPDATE = "ota_update"
 
     const val HEATER_OFF_UNTIL_CONDITIONS = "until_conditions"
     const val HEATER_OFF_UNTIL_STARTED = "until_started"
@@ -69,6 +70,61 @@ object Protocol {
             .put("mode", if (untilStarted) HEATER_OFF_UNTIL_STARTED else HEATER_OFF_UNTIL_CONDITIONS)
 
     fun heaterOn(): JSONObject = JSONObject().put("cmd", CMD_HEATER_ON)
+
+    /**
+     * Asks the device to download and install the firmware.bin of the GitHub
+     * release [tag] ("latest" or e.g. "v1.2.0"). Unless [force] is set, the
+     * device skips a release whose version it is already running.
+     */
+    fun otaUpdate(tag: String, force: Boolean = false): JSONObject =
+        JSONObject()
+            .put("cmd", CMD_OTA_UPDATE)
+            .put("tag", tag)
+            .put("force", force)
+}
+
+/** Where a firmware update stands, mirroring the telemetry "ota" object. */
+enum class OtaState {
+    IDLE,
+
+    /** The running firmware was just installed and is not confirmed yet. */
+    VERIFYING,
+    DOWNLOADING,
+
+    /** The requested release is the version already running. */
+    UP_TO_DATE,
+
+    /** Installed; the device is about to restart into it. */
+    REBOOTING,
+    FAILED,
+
+    /** Anything the firmware may add later. */
+    UNKNOWN,
+    ;
+
+    companion object {
+        fun fromName(value: String): OtaState = when (value) {
+            "idle" -> IDLE
+            "verifying" -> VERIFYING
+            "downloading" -> DOWNLOADING
+            "uptodate" -> UP_TO_DATE
+            "rebooting" -> REBOOTING
+            "failed" -> FAILED
+            else -> UNKNOWN
+        }
+    }
+}
+
+data class OtaStatus(
+    val state: OtaState,
+    /** Download progress 0-100, null when not known. */
+    val percent: Int?,
+    /** The version being installed, once the device has read it from the image. */
+    val version: String?,
+    val error: String?,
+) {
+    val inProgress: Boolean
+        get() = state == OtaState.DOWNLOADING || state == OtaState.REBOOTING
 }
 
 /** One DS18B20 reading as reported in the telemetry document's "t" array. */
@@ -152,6 +208,10 @@ data class Telemetry(
     val heaterOnThresholdC: Double,
     val heaterOffThresholdC: Double,
     val forceState: HeaterForceState,
+    /** Version of the running firmware; null on firmware that does not report it. */
+    val firmwareVersion: String?,
+    /** null on firmware without OTA support. */
+    val ota: OtaStatus?,
 ) {
     val waterSensor: SensorReading?
         get() = sensors.firstOrNull { it.isWaterSensor }
@@ -175,6 +235,7 @@ data class Telemetry(
             }
             val wifi = root.optJSONObject("wifi")
             val mqtt = root.optJSONObject("mqtt")
+            val ota = root.optJSONObject("ota")
             return Telemetry(
                 sensors = sensors,
                 wifiConnected = wifi?.optBoolean("c", false) ?: false,
@@ -196,6 +257,15 @@ data class Telemetry(
                 heaterOnThresholdC = root.optDouble("onC", Double.NaN),
                 heaterOffThresholdC = root.optDouble("offC", Double.NaN),
                 forceState = HeaterForceState.fromInt(root.optInt("forceState", 0)),
+                firmwareVersion = root.optString("fw").takeIf { it.isNotEmpty() },
+                ota = ota?.let {
+                    OtaStatus(
+                        state = OtaState.fromName(it.optString("state")),
+                        percent = if (it.has("pct")) it.getInt("pct") else null,
+                        version = it.optString("ver").takeIf { v -> v.isNotEmpty() },
+                        error = it.optString("err").takeIf { e -> e.isNotEmpty() },
+                    )
+                },
             )
         }
     }

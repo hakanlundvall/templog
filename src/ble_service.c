@@ -37,7 +37,7 @@ static const ble_uuid128_t CHR_STATUS_UUID =
 /* Sized separately: telemetry is by far the largest document, while an
  * incoming command is at most a Wi-Fi or broker URL payload. Keeping the
  * command buffer small matters because it lives on the NimBLE host stack. */
-#define MAX_TELEMETRY_JSON_LEN 1024
+#define MAX_TELEMETRY_JSON_LEN 1280
 #define MAX_STATUS_JSON_LEN 256
 #define MAX_CMD_JSON_LEN 512
 
@@ -187,6 +187,18 @@ static void handle_command_json(const char *json, size_t len)
         }
     } else if (strcmp(cmd, "heater_on") == 0) {
         out.type = BLE_CMD_HEATER_ON;
+    } else if (strcmp(cmd, "ota_update") == 0) {
+        const cJSON *tag = cJSON_GetObjectItemCaseSensitive(root, "tag");
+        const cJSON *force = cJSON_GetObjectItemCaseSensitive(root, "force");
+        const char *tag_s = cJSON_IsString(tag) ? tag->valuestring : "latest";
+        if (strlen(tag_s) >= BLE_OTA_TAG_LEN) {
+            ok = false;
+            error = "tag too long";
+        } else {
+            out.type = BLE_CMD_OTA_UPDATE;
+            strlcpy(out.data.ota.tag, tag_s, sizeof(out.data.ota.tag));
+            out.data.ota.force = cJSON_IsTrue(force);
+        }
     } else {
         ok = false;
         error = "unknown cmd";
@@ -437,6 +449,18 @@ void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
     cJSON_AddNumberToObject(root, "onC", telemetry->heater_on_threshold_c);
     cJSON_AddNumberToObject(root, "offC", telemetry->heater_off_threshold_c);
     cJSON_AddNumberToObject(root, "forceState", telemetry->heater_force_state);
+    cJSON_AddStringToObject(root, "fw", telemetry->fw_version);
+    cJSON *ota = cJSON_AddObjectToObject(root, "ota");
+    cJSON_AddStringToObject(ota, "state", telemetry->ota_state ? telemetry->ota_state : "idle");
+    if (telemetry->ota_percent >= 0) {
+        cJSON_AddNumberToObject(ota, "pct", telemetry->ota_percent);
+    }
+    if (telemetry->ota_version[0] != '\0') {
+        cJSON_AddStringToObject(ota, "ver", telemetry->ota_version);
+    }
+    if (telemetry->ota_error != NULL) {
+        cJSON_AddStringToObject(ota, "err", telemetry->ota_error);
+    }
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     char *out = cJSON_PrintUnformatted(root);

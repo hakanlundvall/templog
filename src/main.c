@@ -26,6 +26,7 @@
 #include <strings.h>
 
 #include "ble_service.h"
+#include "ota.h"
 
 uint8_t ssid[32];
 uint8_t password[64];
@@ -418,6 +419,10 @@ static void connection_monitor_task(void *arg)
 #define HEATER_OFF_THRESHOLD 80.0f
 #define HEATER_ON_THRESHOLD 60.0f
 #define TEMP_READING_TIMEOUT_MS 60000
+/* How long a freshly installed firmware gets to reach Wi-Fi before it is
+ * rolled back. Covers the bounded first connect at boot plus the connection
+ * monitor's retry period. */
+#define OTA_CONFIRM_TIMEOUT_MS 120000
 
 /* Per-sensor history. At file scope because telemetry is published both from
  * the sampling loop and from the idle loop that runs when no sensor was
@@ -638,6 +643,24 @@ static void process_ble_commands(void)
             ble_service_report_status("heater_on", true, NULL);
             break;
         }
+        case BLE_CMD_OTA_UPDATE:
+        {
+            const char *error = NULL;
+            if (!s_wifi_connected)
+            {
+                ble_service_report_status("ota_update", false, "Wi-Fi not connected");
+                break;
+            }
+            if (!ota_start(cmd.data.ota.tag, cmd.data.ota.force, &error))
+            {
+                ESP_LOGW(TAG, "Firmware update to %s not started: %s", cmd.data.ota.tag, error);
+                ble_service_report_status("ota_update", false, error);
+                break;
+            }
+            ESP_LOGI(TAG, "Firmware update to %s started via BLE", cmd.data.ota.tag);
+            ble_service_report_status("ota_update", true, NULL);
+            break;
+        }
         }
     }
 }
@@ -677,7 +700,34 @@ static void publish_telemetry(void)
     telemetry.heater_on_threshold_c = heater_on_threshold;
     telemetry.heater_off_threshold_c = heater_off_threshold;
     telemetry.heater_force_state = (int)heater_force_state;
+    strlcpy(telemetry.fw_version, ota_running_version(), sizeof(telemetry.fw_version));
+    ota_status_t ota;
+    ota_get_status(&ota);
+    telemetry.ota_state = ota_state_name(ota.state);
+    telemetry.ota_percent = ota.percent;
+    strlcpy(telemetry.ota_version, ota.version, sizeof(telemetry.ota_version));
+    telemetry.ota_error = ota.error;
     ble_service_update_telemetry(&telemetry);
+}
+
+/* Called once per loop pass, so getting here means BLE is up and the control
+ * loop runs. A new image also has to reach Wi-Fi if it is configured, since
+ * one that cannot would never be updated remotely again; if it does not get
+ * there in time, the bootloader goes back to the previous image. */
+static void check_pending_firmware(void)
+{
+    if (!ota_is_pending_verify())
+    {
+        return;
+    }
+    if (!has_wifi_config() || s_wifi_connected)
+    {
+        ota_confirm_if_pending();
+    }
+    else if (xTaskGetTickCount() * portTICK_PERIOD_MS >= OTA_CONFIRM_TIMEOUT_MS)
+    {
+        ota_rollback_if_pending();
+    }
 }
 
 _Noreturn void app_main()
@@ -773,6 +823,8 @@ _Noreturn void app_main()
         }
         printf("Heater force state: %d\n", (int)heater_force_state);
     }
+
+    ota_init();
 
     g_ble_cmd_queue = xQueueCreate(8, sizeof(ble_command_t));
     ble_service_init(g_ble_cmd_queue);
@@ -986,6 +1038,7 @@ _Noreturn void app_main()
 
             publish_telemetry();
             publish_heater_state();
+            check_pending_firmware();
 
             // Print results in a separate loop, after all have been read
             printf("\nTemperature readings (degrees C): sample %d\n", ++sample_count);
@@ -1064,6 +1117,7 @@ _Noreturn void app_main()
 
         publish_telemetry();
         publish_heater_state();
+        check_pending_firmware();
 
         level = level ? 0 : 1;
         gpio_set_level(GPIO_NUM_18, level2);

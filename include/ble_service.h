@@ -12,6 +12,8 @@ extern "C" {
 #define BLE_MAX_TEMP_SENSORS 8
 #define BLE_ROM_CODE_HEX_LEN 16 /* 8 bytes -> 16 hex chars, plus NUL */
 #define BLE_MQTT_URL_LEN 100    /* matches the broker URL buffer in main.c */
+#define BLE_FW_VERSION_LEN 32   /* esp_app_desc_t.version, including the terminator */
+#define BLE_OTA_TAG_LEN 32      /* matches OTA_TAG_MAX_LEN in ota.h */
 
 /* One temperature reading reported to the Raspberry Pi. */
 typedef struct {
@@ -41,6 +43,13 @@ typedef struct {
     float heater_off_threshold_c;
     /* 0 = automatic, 1 = forced off until conditions met again, 2 = forced off until explicitly started */
     int heater_force_state;
+    char fw_version[BLE_FW_VERSION_LEN];
+    /* OTA progress: state name from ota_state_name(), percent (-1 if unknown),
+     * the version being installed ("" if not known) and an error or NULL. */
+    const char *ota_state;
+    int ota_percent;
+    char ota_version[BLE_FW_VERSION_LEN];
+    const char *ota_error;
 } ble_telemetry_t;
 
 typedef enum {
@@ -50,6 +59,7 @@ typedef enum {
     BLE_CMD_SET_THRESHOLDS,
     BLE_CMD_HEATER_FORCE_OFF,
     BLE_CMD_HEATER_ON,
+    BLE_CMD_OTA_UPDATE,
 } ble_cmd_type_t;
 
 typedef enum {
@@ -78,6 +88,10 @@ typedef struct {
         struct {
             ble_heater_force_mode_t mode;
         } heater_force_off;
+        struct {
+            char tag[BLE_OTA_TAG_LEN];
+            bool force;
+        } ota;
     } data;
 } ble_command_t;
 

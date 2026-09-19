@@ -421,6 +421,15 @@ void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
     cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
     cJSON_AddBoolToObject(wifi, "c", telemetry->wifi_connected);
     cJSON_AddStringToObject(wifi, "ssid", telemetry->wifi_ssid);
+    if (telemetry->wifi_rssi_valid) {
+        cJSON_AddNumberToObject(wifi, "rssi", telemetry->wifi_rssi);
+    }
+    cJSON_AddNumberToObject(wifi, "disc", telemetry->wifi_disconnect_count);
+    if (telemetry->wifi_disconnect_count > 0) {
+        cJSON_AddNumberToObject(wifi, "reason", telemetry->wifi_last_disc_reason);
+        cJSON_AddNumberToObject(wifi, "discRssi", telemetry->wifi_last_disc_rssi);
+        cJSON_AddNumberToObject(wifi, "discAge", telemetry->wifi_last_disc_age_ms);
+    }
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
     cJSON_AddBoolToObject(mqtt, "c", telemetry->mqtt_connected);
     cJSON_AddStringToObject(mqtt, "url", telemetry->mqtt_url);

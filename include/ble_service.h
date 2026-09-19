@@ -28,6 +28,12 @@ typedef struct {
     int num_readings;
     bool wifi_connected;
     char wifi_ssid[33];
+    bool wifi_rssi_valid;             /* false while not associated */
+    int8_t wifi_rssi;                 /* current AP signal strength, dBm */
+    uint32_t wifi_disconnect_count;   /* STA_DISCONNECTED events since boot */
+    uint8_t wifi_last_disc_reason;    /* wifi_err_reason_t of the last one; 0 = none yet */
+    int8_t wifi_last_disc_rssi;       /* RSSI reported with the last disconnect, dBm */
+    uint32_t wifi_last_disc_age_ms;   /* time since the last disconnect; UINT32_MAX if none */
     bool mqtt_connected;
     char mqtt_url[BLE_MQTT_URL_LEN];
     bool heater_on;

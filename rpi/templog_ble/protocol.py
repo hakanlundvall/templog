@@ -29,6 +29,7 @@ CMD_SET_WATER_SENSOR = "set_water_sensor"
 CMD_SET_THRESHOLDS = "set_thresholds"
 CMD_HEATER_OFF = "heater_off"
 CMD_HEATER_ON = "heater_on"
+CMD_OTA_UPDATE = "ota_update"
 
 HEATER_OFF_UNTIL_CONDITIONS = "until_conditions"
 HEATER_OFF_UNTIL_STARTED = "until_started"

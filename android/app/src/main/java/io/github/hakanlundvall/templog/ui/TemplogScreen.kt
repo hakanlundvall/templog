@@ -353,6 +353,28 @@ private fun WifiCard(telemetry: Telemetry, enabled: Boolean, onEdit: () -> Unit)
                 },
                 style = MaterialTheme.typography.bodyMedium,
             )
+            telemetry.wifiRssi?.let {
+                Text(
+                    "Signal: $it dBm",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            telemetry.wifiDisconnects?.let { count ->
+                Text(
+                    "Disconnects since boot: $count",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            telemetry.lastWifiDisconnect?.let { disc ->
+                val reason = disc.reasonName?.let { "${disc.reason} ($it)" } ?: "${disc.reason}"
+                Text(
+                    "Last: ${formatAge(disc.ageMs)} ago, reason $reason, ${disc.rssi} dBm",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             OutlinedButton(onClick = onEdit, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
                 Text("Change credentials")
             }

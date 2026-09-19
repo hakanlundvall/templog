@@ -106,11 +106,46 @@ enum class HeaterForceState {
     }
 }
 
+/** The most recent Wi-Fi disconnect the ESP32 saw since it booted. */
+data class WifiDisconnect(
+    /** ESP-IDF `wifi_err_reason_t` code. */
+    val reason: Int,
+    val rssi: Int,
+    val ageMs: Long,
+) {
+    /** A short name for the common reason codes, or null for the rest. */
+    val reasonName: String?
+        get() = when (reason) {
+            1 -> "unspecified"
+            2 -> "auth expired"
+            3 -> "deauthenticated by AP"
+            4 -> "disassociated, inactivity"
+            5 -> "AP has too many stations"
+            6 -> "not authenticated"
+            7 -> "not associated"
+            8 -> "disassociated by AP"
+            15 -> "4-way handshake timeout"
+            16 -> "group key update timeout"
+            200 -> "beacon timeout"
+            201 -> "no AP found"
+            202 -> "auth failed"
+            203 -> "association failed"
+            204 -> "handshake timeout"
+            205 -> "connection failed"
+            else -> null
+        }
+}
+
 /** A decoded telemetry snapshot. */
 data class Telemetry(
     val sensors: List<SensorReading>,
     val wifiConnected: Boolean,
     val wifiSsid: String,
+    /** Current signal strength in dBm; null while not associated or on older firmware. */
+    val wifiRssi: Int?,
+    /** Disconnect events since boot; null on firmware that does not report it. */
+    val wifiDisconnects: Long?,
+    val lastWifiDisconnect: WifiDisconnect?,
     val mqttConnected: Boolean,
     val mqttUrl: String,
     val heaterOn: Boolean,
@@ -144,6 +179,17 @@ data class Telemetry(
                 sensors = sensors,
                 wifiConnected = wifi?.optBoolean("c", false) ?: false,
                 wifiSsid = wifi?.optString("ssid").orEmpty(),
+                wifiRssi = if (wifi?.has("rssi") == true) wifi.getInt("rssi") else null,
+                wifiDisconnects = if (wifi?.has("disc") == true) wifi.getLong("disc") else null,
+                lastWifiDisconnect = if (wifi?.has("reason") == true) {
+                    WifiDisconnect(
+                        reason = wifi.getInt("reason"),
+                        rssi = wifi.optInt("discRssi", 0),
+                        ageMs = wifi.optLong("discAge", 0),
+                    )
+                } else {
+                    null
+                },
                 mqttConnected = mqtt?.optBoolean("c", false) ?: false,
                 mqttUrl = mqtt?.optString("url").orEmpty(),
                 heaterOn = root.optBoolean("heater", false),

@@ -447,6 +447,22 @@ static bool apply_mqtt_config(const char **error)
     return true;
 }
 
+/* The force-off state lives in NVS so that a heater stopped over BLE stays
+ * stopped across a reboot instead of silently reverting to automatic control. */
+static void set_heater_force_state(heater_force_state_t state)
+{
+    heater_force_state = state;
+    esp_err_t ret = nvs_set_u8(g_nvs_handle, "heatForce", (uint8_t)state);
+    if (ret == ESP_OK)
+    {
+        ret = nvs_commit(g_nvs_handle);
+    }
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to persist heater force state: %s", esp_err_to_name(ret));
+    }
+}
+
 static void process_ble_commands(void)
 {
     ble_command_t cmd;
@@ -542,9 +558,9 @@ static void process_ble_commands(void)
         }
         case BLE_CMD_HEATER_FORCE_OFF:
         {
-            heater_force_state = cmd.data.heater_force_off.mode == BLE_HEATER_FORCE_OFF_UNTIL_STARTED
-                                      ? HEATER_FORCE_OFF_UNTIL_STARTED
-                                      : HEATER_FORCE_OFF_UNTIL_CONDITIONS;
+            set_heater_force_state(cmd.data.heater_force_off.mode == BLE_HEATER_FORCE_OFF_UNTIL_STARTED
+                                       ? HEATER_FORCE_OFF_UNTIL_STARTED
+                                       : HEATER_FORCE_OFF_UNTIL_CONDITIONS);
             heater_on = false;
             gpio_set_level(GPIO_HEATER, heater_on);
             ESP_LOGI(TAG, "Heater forced off (mode=%d)", (int)heater_force_state);
@@ -553,7 +569,7 @@ static void process_ble_commands(void)
         }
         case BLE_CMD_HEATER_ON:
         {
-            heater_force_state = HEATER_FORCE_NONE;
+            set_heater_force_state(HEATER_FORCE_NONE);
             if (!isnan(last_water_temp) && last_water_temp >= heater_off_threshold)
             {
                 heater_on = false;
@@ -695,6 +711,13 @@ _Noreturn void app_main()
         heater_on_threshold = (nvs_get_i32(my_handle, "heatOnC", &on_centi) == ESP_OK) ? on_centi / 100.0f : HEATER_ON_THRESHOLD;
         heater_off_threshold = (nvs_get_i32(my_handle, "heatOffC", &off_centi) == ESP_OK) ? off_centi / 100.0f : HEATER_OFF_THRESHOLD;
         printf("Heater thresholds: on=%.1f off=%.1f\n", heater_on_threshold, heater_off_threshold);
+
+        uint8_t force = HEATER_FORCE_NONE;
+        if (nvs_get_u8(my_handle, "heatForce", &force) == ESP_OK && force <= HEATER_FORCE_OFF_UNTIL_STARTED)
+        {
+            heater_force_state = (heater_force_state_t)force;
+        }
+        printf("Heater force state: %d\n", (int)heater_force_state);
     }
 
     g_ble_cmd_queue = xQueueCreate(8, sizeof(ble_command_t));
@@ -880,7 +903,7 @@ _Noreturn void app_main()
                     {
                         if (want_on)
                         {
-                            heater_force_state = HEATER_FORCE_NONE;
+                            set_heater_force_state(HEATER_FORCE_NONE);
                             heater_on = true;
                             ESP_LOGI(TAG, "Start conditions met again; resuming automatic heater control");
                         }

@@ -54,6 +54,9 @@ static volatile uint8_t s_wifi_last_disc_reason = 0;
 static volatile int8_t s_wifi_last_disc_rssi = 0;
 static volatile TickType_t s_wifi_last_disc_tick = 0;
 static esp_mqtt_client_handle_t g_mqtt_client = NULL;
+/* Set by the MQTT event handler on every (re)connect so the sampling loop
+ * republishes the heater state, even if it has not changed meanwhile. */
+static volatile bool s_heater_state_dirty = true;
 
 typedef enum {
     HEATER_FORCE_NONE = 0,
@@ -229,6 +232,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
         s_mqtt_connected = true;
+        s_heater_state_dirty = true;
         // esp_mqtt_client_publish(event->client, "temp/1/status", "connected", 0, 1, 0);
 
         break;
@@ -315,6 +319,56 @@ static void mqtt_publish(const char *topic, const char *payload, int len)
     }
     int msg_id = esp_mqtt_client_publish(client, topic, payload, len, 1, 0);
     ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+}
+
+#define HEATER_STATE_TOPIC "temp/1/heater"
+#define HEATER_MODE_TOPIC "temp/1/heater/mode"
+
+static const char *heater_mode_name(heater_force_state_t state)
+{
+    switch (state)
+    {
+    case HEATER_FORCE_OFF_UNTIL_CONDITIONS:
+        return "off_until_conditions";
+    case HEATER_FORCE_OFF_UNTIL_STARTED:
+        return "off_until_started";
+    case HEATER_FORCE_NONE:
+    default:
+        return "auto";
+    }
+}
+
+/* Publishes the heater output and mode as retained messages whenever either
+ * changes, and again after each broker reconnect, so a subscriber such as
+ * Home Assistant always sees the current state. Nothing is sent while the
+ * broker is unreachable; the pending change goes out once it is back. */
+static void publish_heater_state(void)
+{
+    static bool last_on = false;
+    static heater_force_state_t last_mode = HEATER_FORCE_NONE;
+
+    if (heater_on != last_on || heater_force_state != last_mode)
+    {
+        s_heater_state_dirty = true;
+    }
+    esp_mqtt_client_handle_t client = g_mqtt_client;
+    if (!s_heater_state_dirty || client == NULL || !s_mqtt_connected)
+    {
+        return;
+    }
+
+    const char *state = heater_on ? "on" : "off";
+    const char *mode = heater_mode_name(heater_force_state);
+    if (esp_mqtt_client_publish(client, HEATER_STATE_TOPIC, state, 0, 1, 1) < 0 ||
+        esp_mqtt_client_publish(client, HEATER_MODE_TOPIC, mode, 0, 1, 1) < 0)
+    {
+        ESP_LOGW(TAG, "Failed to publish heater state; will retry");
+        return;
+    }
+    ESP_LOGI(TAG, "Published heater state=%s mode=%s", state, mode);
+    last_on = heater_on;
+    last_mode = heater_force_state;
+    s_heater_state_dirty = false;
 }
 
 static void connection_monitor_task(void *arg)
@@ -931,6 +985,7 @@ _Noreturn void app_main()
             gpio_set_level(GPIO_HEATER, heater_on);
 
             publish_telemetry();
+            publish_heater_state();
 
             // Print results in a separate loop, after all have been read
             printf("\nTemperature readings (degrees C): sample %d\n", ++sample_count);
@@ -1008,6 +1063,7 @@ _Noreturn void app_main()
         gpio_set_level(GPIO_HEATER, heater_on);
 
         publish_telemetry();
+        publish_heater_state();
 
         level = level ? 0 : 1;
         gpio_set_level(GPIO_NUM_18, level2);

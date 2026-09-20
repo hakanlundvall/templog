@@ -61,8 +61,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "${{ github.ref_name }}"
-          .pio/build/featheresp32/firmware.bin
-          --title "${{ github.ref_name }}"
-          --generate-notes
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The app workflow publishes to the same release, so whichever job
+          # gets there first creates it.
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" .pio/build/featheresp32/firmware.bin --clobber

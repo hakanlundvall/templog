@@ -37,6 +37,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -44,6 +45,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -76,6 +78,14 @@ fun TemplogScreen(
     val busy by viewModel.busy.collectAsStateWithLifecycle()
     val releaseCheck by viewModel.releaseCheck.collectAsStateWithLifecycle()
     val transfer by viewModel.transfer.collectAsStateWithLifecycle()
+
+    // A transfer over BLE takes minutes and dies with the process if Android
+    // freezes the app, so hold the screen awake while one is running.
+    val view = LocalView.current
+    DisposableEffect(transfer != null) {
+        view.keepScreenOn = transfer != null
+        onDispose { view.keepScreenOn = false }
+    }
 
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(Unit) {

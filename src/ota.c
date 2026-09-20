@@ -10,6 +10,7 @@
 #include "esp_https_ota.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "esp_rom_crc.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,10 +27,27 @@ static const char *TAG = "ota";
 /* Leaves time for the BLE client to read the final status before the reset. */
 #define OTA_REBOOT_DELAY_MS 3000
 
+/* A phone that has finished sending simply stops writing, so a session that
+ * goes quiet for this long is abandoned and its flash handle released. */
+#define OTA_BLE_IDLE_TIMEOUT_MS 30000
+
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static ota_status_t s_status = {.state = OTA_STATE_IDLE, .percent = -1};
 static bool s_pending_verify = false;
 static bool s_busy = false;
+
+/* A firmware image being pushed over BLE. Only the BLE host task writes to it
+ * while a session is open, and the application task ends or times it out
+ * between chunks, so no extra locking is needed beyond the status fields. */
+static struct {
+    bool active;
+    esp_ota_handle_t handle;
+    uint32_t size;      /* image size the phone announced */
+    uint32_t received;  /* bytes written so far; also the next expected offset */
+    uint32_t crc32;     /* CRC32 the phone announced */
+    uint32_t running_crc32;
+    TickType_t last_activity;
+} s_ble;
 
 typedef struct {
     char url[160];
@@ -303,6 +321,192 @@ fail:
     return false;
 }
 
+static void ota_ble_fail(const char *error)
+{
+    if (s_ble.active)
+    {
+        esp_ota_abort(s_ble.handle);
+        s_ble.active = false;
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_busy = false;
+    portEXIT_CRITICAL(&s_lock);
+    set_status(OTA_STATE_FAILED, -1, error);
+}
+
+bool ota_ble_begin(uint32_t size, uint32_t crc32, const char *version, bool force, const char **error)
+{
+    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
+    if (target == NULL)
+    {
+        *error = "no OTA partition available";
+        return false;
+    }
+    if (size == 0 || size > target->size)
+    {
+        *error = "image does not fit in the OTA partition";
+        return false;
+    }
+    if (s_pending_verify)
+    {
+        *error = "current firmware not confirmed yet; try again shortly";
+        return false;
+    }
+    if (!force && version != NULL && version[0] != '\0' &&
+        strncmp(version, ota_running_version(), OTA_VERSION_LEN) == 0)
+    {
+        set_version(version);
+        set_status(OTA_STATE_UP_TO_DATE, -1, NULL);
+        *error = "already running that version";
+        return false;
+    }
+
+    /* A stale session from an interrupted transfer must not hold the flash
+     * handle, nor the busy flag the check below looks at. */
+    ota_ble_abort();
+
+    portENTER_CRITICAL(&s_lock);
+    bool busy = s_busy;
+    s_busy = true;
+    portEXIT_CRITICAL(&s_lock);
+    if (busy)
+    {
+        *error = "an update is already running";
+        return false;
+    }
+
+    esp_err_t err = esp_ota_begin(target, size, &s_ble.handle);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        portENTER_CRITICAL(&s_lock);
+        s_busy = false;
+        portEXIT_CRITICAL(&s_lock);
+        *error = "could not open the OTA partition";
+        return false;
+    }
+
+    s_ble.active = true;
+    s_ble.size = size;
+    s_ble.received = 0;
+    s_ble.crc32 = crc32;
+    s_ble.running_crc32 = 0;
+    s_ble.last_activity = xTaskGetTickCount();
+    set_version(version != NULL ? version : "");
+    set_status(OTA_STATE_RECEIVING, 0, NULL);
+    ESP_LOGI(TAG, "Receiving %lu bytes over BLE into %s", (unsigned long)size, target->label);
+    return true;
+}
+
+bool ota_ble_write(uint32_t offset, const uint8_t *data, size_t len)
+{
+    if (!s_ble.active)
+    {
+        return false;
+    }
+    if (offset != s_ble.received)
+    {
+        ESP_LOGE(TAG, "Chunk at %lu, expected %lu", (unsigned long)offset, (unsigned long)s_ble.received);
+        ota_ble_fail("chunk out of order");
+        return false;
+    }
+    if (len == 0 || s_ble.received + len > s_ble.size)
+    {
+        ota_ble_fail("more data than announced");
+        return false;
+    }
+
+    esp_err_t err = esp_ota_write(s_ble.handle, data, len);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+        ota_ble_fail("could not write to flash");
+        return false;
+    }
+
+    s_ble.running_crc32 = esp_rom_crc32_le(s_ble.running_crc32, data, len);
+    s_ble.received += len;
+    s_ble.last_activity = xTaskGetTickCount();
+    set_status(OTA_STATE_RECEIVING, (int)(100ULL * s_ble.received / s_ble.size), NULL);
+    return true;
+}
+
+bool ota_ble_end(const char **error)
+{
+    if (!s_ble.active)
+    {
+        *error = "no transfer in progress";
+        return false;
+    }
+    if (s_ble.received != s_ble.size)
+    {
+        ESP_LOGE(TAG, "Got %lu of %lu bytes", (unsigned long)s_ble.received, (unsigned long)s_ble.size);
+        *error = "transfer incomplete";
+        ota_ble_fail(*error);
+        return false;
+    }
+    if (s_ble.running_crc32 != s_ble.crc32)
+    {
+        ESP_LOGE(TAG, "CRC32 %08lx, expected %08lx", (unsigned long)s_ble.running_crc32,
+                 (unsigned long)s_ble.crc32);
+        *error = "checksum mismatch";
+        ota_ble_fail(*error);
+        return false;
+    }
+
+    esp_err_t err = esp_ota_end(s_ble.handle);
+    s_ble.active = false;
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        *error = err == ESP_ERR_OTA_VALIDATE_FAILED ? "image failed validation" : "could not finish the update";
+        ota_ble_fail(*error);
+        return false;
+    }
+
+    err = esp_ota_set_boot_partition(esp_ota_get_next_update_partition(NULL));
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        *error = "could not activate the image";
+        ota_ble_fail(*error);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Image received over BLE; rebooting");
+    set_status(OTA_STATE_REBOOTING, 100, NULL);
+    return true;
+}
+
+void ota_ble_abort(void)
+{
+    if (!s_ble.active)
+    {
+        return;
+    }
+    ESP_LOGW(TAG, "BLE transfer aborted after %lu bytes", (unsigned long)s_ble.received);
+    esp_ota_abort(s_ble.handle);
+    s_ble.active = false;
+    portENTER_CRITICAL(&s_lock);
+    s_busy = false;
+    portEXIT_CRITICAL(&s_lock);
+    set_status(OTA_STATE_IDLE, -1, NULL);
+}
+
+void ota_ble_tick(void)
+{
+    if (!s_ble.active)
+    {
+        return;
+    }
+    if ((xTaskGetTickCount() - s_ble.last_activity) >= pdMS_TO_TICKS(OTA_BLE_IDLE_TIMEOUT_MS))
+    {
+        ESP_LOGW(TAG, "BLE transfer stalled at %lu of %lu bytes",
+                 (unsigned long)s_ble.received, (unsigned long)s_ble.size);
+        ota_ble_fail("transfer stalled");
+    }
+}
+
 void ota_get_status(ota_status_t *out)
 {
     portENTER_CRITICAL(&s_lock);
@@ -318,6 +522,8 @@ const char *ota_state_name(ota_state_t state)
         return "verifying";
     case OTA_STATE_DOWNLOADING:
         return "downloading";
+    case OTA_STATE_RECEIVING:
+        return "receiving";
     case OTA_STATE_UP_TO_DATE:
         return "uptodate";
     case OTA_STATE_REBOOTING:

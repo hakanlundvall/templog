@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -60,6 +61,9 @@ typedef enum {
     BLE_CMD_HEATER_FORCE_OFF,
     BLE_CMD_HEATER_ON,
     BLE_CMD_OTA_UPDATE,
+    BLE_CMD_OTA_BLE_BEGIN,
+    BLE_CMD_OTA_BLE_END,
+    BLE_CMD_OTA_BLE_ABORT,
 } ble_cmd_type_t;
 
 typedef enum {
@@ -92,13 +96,27 @@ typedef struct {
             char tag[BLE_OTA_TAG_LEN];
             bool force;
         } ota;
+        struct {
+            uint32_t size;
+            uint32_t crc32;
+            char version[BLE_FW_VERSION_LEN];
+            bool force;
+        } ota_ble;
     } data;
 } ble_command_t;
 
+/* Firmware bytes pushed to the firmware characteristic, delivered straight to
+ * the application rather than through the command queue: an image is far too
+ * large to pass as queued commands. Called from the NimBLE host task, which is
+ * also what paces the sender, since the next chunk is only accepted once this
+ * returns. Returning false means the transfer was dropped. */
+typedef bool (*ble_firmware_chunk_cb)(uint32_t offset, const uint8_t *data, size_t len);
+
 /* Initializes the NimBLE GATT server and starts advertising.
  * Decoded commands are pushed to command_queue (items of type ble_command_t)
- * from the NimBLE host task; the application must drain this queue itself. */
-void ble_service_init(QueueHandle_t command_queue);
+ * from the NimBLE host task; the application must drain this queue itself.
+ * on_firmware_chunk may be NULL if the application accepts no image over BLE. */
+void ble_service_init(QueueHandle_t command_queue, ble_firmware_chunk_cb on_firmware_chunk);
 
 /* Publishes a new telemetry snapshot and notifies any subscribed client. */
 void ble_service_update_telemetry(const ble_telemetry_t *telemetry);

@@ -18,12 +18,18 @@ import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
+import java.util.zip.CRC32
 
 /**
  * Owns the BLE client and turns UI intents into commands, serialising them so
  * the single status characteristic is never raced over by two writers.
  */
 class TemplogViewModel(application: Application) : AndroidViewModel(application) {
+
+    private companion object {
+        /** The device validates the whole image before it answers. */
+        const val END_TIMEOUT_MS = 30_000L
+    }
 
     private val client = TemplogBleClient(application)
 
@@ -39,6 +45,11 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
 
     /** One-shot user facing results of commands, rendered as a snackbar. */
     val messages = _messages.receiveAsFlow()
+
+    private val _transfer = MutableStateFlow<FirmwareTransfer?>(null)
+
+    /** Progress of an image the phone is fetching and pushing over BLE. */
+    val transfer: StateFlow<FirmwareTransfer?> = _transfer.asStateFlow()
 
     private val _releaseCheck = MutableStateFlow<ReleaseCheck>(ReleaseCheck.NotChecked)
 
@@ -99,6 +110,50 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
     fun installFirmware(tag: String) =
         issue("Firmware update to $tag started", Protocol.otaUpdate(tag))
 
+    /**
+     * Installs [release] without using the device's Wi-Fi: the phone fetches
+     * the image from GitHub and writes it to the device over BLE, which takes
+     * a couple of minutes. The device checks the CRC before it switches over.
+     */
+    fun installFirmwareOverBle(release: FirmwareRelease) {
+        if (_busy.value) {
+            _messages.trySend("Another command is still running")
+            return
+        }
+        viewModelScope.launch {
+            _busy.value = true
+            _transfer.value = FirmwareTransfer.Downloading(0, release.assetSize)
+            var started = false
+            try {
+                val image = FirmwareReleases.download(release) { bytes, total ->
+                    _transfer.value = FirmwareTransfer.Downloading(bytes, total)
+                }
+                val crc32 = CRC32().apply { update(image) }.value
+
+                client.sendCommand(Protocol.otaBleBegin(image.size, crc32, release.tag))
+                started = true
+                _transfer.value = FirmwareTransfer.Sending(0, image.size)
+                client.sendFirmware(image) { sent ->
+                    _transfer.value = FirmwareTransfer.Sending(sent, image.size)
+                }
+
+                // The device validates the image, then restarts into it, so
+                // the link drops moments after this reply.
+                client.sendCommand(Protocol.otaBleEnd(), timeoutMs = END_TIMEOUT_MS)
+                _messages.trySend("${release.tag} sent; the device is restarting")
+            } catch (e: CommandException) {
+                if (started) runCatching { client.sendCommand(Protocol.otaBleAbort()) }
+                _messages.trySend(e.message ?: "firmware transfer failed")
+            } catch (e: IOException) {
+                if (started) runCatching { client.sendCommand(Protocol.otaBleAbort()) }
+                _messages.trySend(e.message ?: "could not download the firmware")
+            } finally {
+                _transfer.value = null
+                _busy.value = false
+            }
+        }
+    }
+
     private fun issue(successMessage: String, command: JSONObject) {
         if (_busy.value) {
             _messages.trySend("Another command is still running")
@@ -124,6 +179,21 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
         client.stop()
         super.onCleared()
     }
+}
+
+/** Where an image the phone is pushing over BLE has got to. */
+sealed interface FirmwareTransfer {
+    val bytes: Int
+    val total: Int
+
+    val fraction: Float
+        get() = if (total > 0) bytes.toFloat() / total else 0f
+
+    /** Fetching the image from GitHub onto the phone. */
+    data class Downloading(override val bytes: Int, override val total: Int) : FirmwareTransfer
+
+    /** Writing the image to the device. */
+    data class Sending(override val bytes: Int, override val total: Int) : FirmwareTransfer
 }
 
 sealed interface ReleaseCheck {

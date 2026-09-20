@@ -33,6 +33,9 @@ static const ble_uuid128_t CHR_COMMAND_UUID =
 static const ble_uuid128_t CHR_STATUS_UUID =
     BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
                       0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
+static const ble_uuid128_t CHR_FIRMWARE_UUID =
+    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                      0x93, 0xf3, 0xa3, 0xb5, 0x04, 0x00, 0x40, 0x6e);
 
 /* Sized separately: telemetry is by far the largest document, while an
  * incoming command is at most a Wi-Fi or broker URL payload. Keeping the
@@ -40,8 +43,13 @@ static const ble_uuid128_t CHR_STATUS_UUID =
 #define MAX_TELEMETRY_JSON_LEN 1280
 #define MAX_STATUS_JSON_LEN 256
 #define MAX_CMD_JSON_LEN 512
+/* One firmware chunk: a 4 byte offset plus as much as an ATT write can carry
+ * at the preferred MTU. */
+#define FIRMWARE_CHUNK_HEADER_LEN 4
+#define MAX_FIRMWARE_CHUNK_LEN 256
 
 static QueueHandle_t s_command_queue;
+static ble_firmware_chunk_cb s_firmware_chunk_cb;
 static SemaphoreHandle_t s_state_mutex;
 
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -81,6 +89,14 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .access_cb = gatt_svr_chr_access,
                 .val_handle = &s_status_val_handle,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
+            },
+            {
+                /* Firmware bytes. Write-without-response keeps the transfer
+                 * reasonably fast; ordering is checked by the offset each
+                 * chunk carries. */
+                .uuid = &CHR_FIRMWARE_UUID.u,
+                .access_cb = gatt_svr_chr_access,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC,
             },
             {0}, /* terminator */
         },
@@ -187,6 +203,30 @@ static void handle_command_json(const char *json, size_t len)
         }
     } else if (strcmp(cmd, "heater_on") == 0) {
         out.type = BLE_CMD_HEATER_ON;
+    } else if (strcmp(cmd, "ota_ble_begin") == 0) {
+        const cJSON *size = cJSON_GetObjectItemCaseSensitive(root, "size");
+        const cJSON *crc = cJSON_GetObjectItemCaseSensitive(root, "crc32");
+        const cJSON *ver = cJSON_GetObjectItemCaseSensitive(root, "ver");
+        const cJSON *force = cJSON_GetObjectItemCaseSensitive(root, "force");
+        if (!cJSON_IsNumber(size) || !cJSON_IsNumber(crc)) {
+            ok = false;
+            error = "size/crc32 required";
+        } else if (size->valuedouble <= 0 || size->valuedouble > (double)UINT32_MAX) {
+            ok = false;
+            error = "invalid size";
+        } else {
+            out.type = BLE_CMD_OTA_BLE_BEGIN;
+            out.data.ota_ble.size = (uint32_t)size->valuedouble;
+            out.data.ota_ble.crc32 = (uint32_t)crc->valuedouble;
+            out.data.ota_ble.force = cJSON_IsTrue(force);
+            if (cJSON_IsString(ver)) {
+                strlcpy(out.data.ota_ble.version, ver->valuestring, sizeof(out.data.ota_ble.version));
+            }
+        }
+    } else if (strcmp(cmd, "ota_ble_end") == 0) {
+        out.type = BLE_CMD_OTA_BLE_END;
+    } else if (strcmp(cmd, "ota_ble_abort") == 0) {
+        out.type = BLE_CMD_OTA_BLE_ABORT;
     } else if (strcmp(cmd, "ota_update") == 0) {
         const cJSON *tag = cJSON_GetObjectItemCaseSensitive(root, "tag");
         const cJSON *force = cJSON_GetObjectItemCaseSensitive(root, "force");
@@ -240,6 +280,29 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
         int rc = read_flat_value(ctxt, s_status_json, s_status_json_len);
         xSemaphoreGive(s_state_mutex);
         return rc;
+    } else if (ble_uuid_cmp(ctxt->chr->uuid, &CHR_FIRMWARE_UUID.u) == 0) {
+        if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        if (len <= FIRMWARE_CHUNK_HEADER_LEN || len > MAX_FIRMWARE_CHUNK_LEN) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        uint8_t buf[MAX_FIRMWARE_CHUNK_LEN];
+        int rc = ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &len);
+        if (rc != 0) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        if (s_firmware_chunk_cb == NULL) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        uint32_t offset = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |
+                          ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+        /* A rejected chunk ends the transfer; the reason reaches the client
+         * through telemetry, since a write without response has no reply. */
+        s_firmware_chunk_cb(offset, buf + FIRMWARE_CHUNK_HEADER_LEN,
+                            len - FIRMWARE_CHUNK_HEADER_LEN);
+        return 0;
     } else if (ble_uuid_cmp(ctxt->chr->uuid, &CHR_COMMAND_UUID.u) == 0) {
         if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
             return BLE_ATT_ERR_UNLIKELY;
@@ -373,9 +436,10 @@ static void host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
-void ble_service_init(QueueHandle_t command_queue)
+void ble_service_init(QueueHandle_t command_queue, ble_firmware_chunk_cb on_firmware_chunk)
 {
     s_command_queue = command_queue;
+    s_firmware_chunk_cb = on_firmware_chunk;
     s_state_mutex = xSemaphoreCreateMutex();
     snprintf(s_telemetry_json, sizeof(s_telemetry_json), "{}");
     s_telemetry_json_len = strlen(s_telemetry_json);

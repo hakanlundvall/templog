@@ -17,6 +17,21 @@ val canSignRelease = !releaseStore.isNullOrBlank() &&
     !releaseKeyAlias.isNullOrBlank() &&
     !releaseKeyPassword.isNullOrBlank()
 
+/* Release builds in CI are tagged, e.g. "v0.1.0"; anything else keeps the
+ * development version. The version code has to grow with each release, or
+ * Android refuses to install the new APK over the old one, so it is derived
+ * from the numbers in the tag: v1.2.3 -> 10203. */
+val tagVersion: String? = System.getenv("APP_VERSION_NAME")?.trim()?.removePrefix("v")
+    ?.takeIf { it.isNotEmpty() }
+
+fun versionCodeFrom(version: String?): Int {
+    val parts = version?.substringBefore('-')?.split('.').orEmpty()
+        .mapNotNull { it.toIntOrNull() }
+    if (parts.isEmpty()) return 1
+    val (major, minor, patch) = List(3) { parts.getOrElse(it) { 0 } }
+    return major * 10000 + minor * 100 + patch
+}
+
 android {
     namespace = "io.github.hakanlundvall.templog"
     compileSdk = 35
@@ -25,8 +40,8 @@ android {
         applicationId = "io.github.hakanlundvall.templog"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = versionCodeFrom(tagVersion)
+        versionName = tagVersion ?: "dev"
     }
 
     signingConfigs {

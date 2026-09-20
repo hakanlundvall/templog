@@ -27,6 +27,7 @@ object Protocol {
     val TELEMETRY_CHAR_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
     val COMMAND_CHAR_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
     val STATUS_CHAR_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+    val FIRMWARE_CHAR_UUID: UUID = UUID.fromString("6e400004-b5a3-f393-e0a9-e50e24dcca9e")
 
     /** Client Characteristic Configuration descriptor, used to subscribe. */
     val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -38,6 +39,15 @@ object Protocol {
     const val CMD_HEATER_OFF = "heater_off"
     const val CMD_HEATER_ON = "heater_on"
     const val CMD_OTA_UPDATE = "ota_update"
+    const val CMD_OTA_BLE_BEGIN = "ota_ble_begin"
+    const val CMD_OTA_BLE_END = "ota_ble_end"
+    const val CMD_OTA_BLE_ABORT = "ota_ble_abort"
+
+    /** Bytes of offset that prefix every chunk on FIRMWARE_CHAR_UUID. */
+    const val FIRMWARE_CHUNK_HEADER = 4
+
+    /** The firmware rejects a write larger than this, header included. */
+    const val FIRMWARE_CHUNK_MAX = 256
 
     const val HEATER_OFF_UNTIL_CONDITIONS = "until_conditions"
     const val HEATER_OFF_UNTIL_STARTED = "until_started"
@@ -81,6 +91,23 @@ object Protocol {
             .put("cmd", CMD_OTA_UPDATE)
             .put("tag", tag)
             .put("force", force)
+
+    /**
+     * Opens a transfer of an image the phone already has. [crc32] is a
+     * standard (zlib) CRC-32 of the whole image, which the device checks
+     * before it accepts the update.
+     */
+    fun otaBleBegin(size: Int, crc32: Long, version: String?, force: Boolean = false): JSONObject =
+        JSONObject()
+            .put("cmd", CMD_OTA_BLE_BEGIN)
+            .put("size", size)
+            .put("crc32", crc32)
+            .put("force", force)
+            .apply { if (version != null) put("ver", version) }
+
+    fun otaBleEnd(): JSONObject = JSONObject().put("cmd", CMD_OTA_BLE_END)
+
+    fun otaBleAbort(): JSONObject = JSONObject().put("cmd", CMD_OTA_BLE_ABORT)
 }
 
 /** Where a firmware update stands, mirroring the telemetry "ota" object. */
@@ -90,6 +117,9 @@ enum class OtaState {
     /** The running firmware was just installed and is not confirmed yet. */
     VERIFYING,
     DOWNLOADING,
+
+    /** The image is arriving over BLE from this phone. */
+    RECEIVING,
 
     /** The requested release is the version already running. */
     UP_TO_DATE,
@@ -107,6 +137,7 @@ enum class OtaState {
             "idle" -> IDLE
             "verifying" -> VERIFYING
             "downloading" -> DOWNLOADING
+            "receiving" -> RECEIVING
             "uptodate" -> UP_TO_DATE
             "rebooting" -> REBOOTING
             "failed" -> FAILED
@@ -124,7 +155,8 @@ data class OtaStatus(
     val error: String?,
 ) {
     val inProgress: Boolean
-        get() = state == OtaState.DOWNLOADING || state == OtaState.REBOOTING
+        get() = state == OtaState.DOWNLOADING || state == OtaState.RECEIVING ||
+            state == OtaState.REBOOTING
 }
 
 /** One DS18B20 reading as reported in the telemetry document's "t" array. */

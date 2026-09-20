@@ -661,6 +661,41 @@ static void process_ble_commands(void)
             ble_service_report_status("ota_update", true, NULL);
             break;
         }
+        case BLE_CMD_OTA_BLE_BEGIN:
+        {
+            const char *error = NULL;
+            if (!ota_ble_begin(cmd.data.ota_ble.size, cmd.data.ota_ble.crc32,
+                               cmd.data.ota_ble.version, cmd.data.ota_ble.force, &error))
+            {
+                ESP_LOGW(TAG, "Firmware transfer not started: %s", error);
+                ble_service_report_status("ota_ble_begin", false, error);
+                break;
+            }
+            ble_service_report_status("ota_ble_begin", true, NULL);
+            break;
+        }
+        case BLE_CMD_OTA_BLE_END:
+        {
+            const char *error = NULL;
+            if (!ota_ble_end(&error))
+            {
+                ESP_LOGW(TAG, "Firmware transfer rejected: %s", error);
+                ble_service_report_status("ota_ble_end", false, error);
+                break;
+            }
+            ble_service_report_status("ota_ble_end", true, NULL);
+            /* Long enough for the status notification to go out, and for the
+             * phone to read it, before the link drops with the reset. */
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
+            break;
+        }
+        case BLE_CMD_OTA_BLE_ABORT:
+        {
+            ota_ble_abort();
+            ble_service_report_status("ota_ble_abort", true, NULL);
+            break;
+        }
         }
     }
 }
@@ -716,6 +751,9 @@ static void publish_telemetry(void)
  * there in time, the bootloader goes back to the previous image. */
 static void check_pending_firmware(void)
 {
+    /* Also the point where a transfer that died with the phone is cleaned up. */
+    ota_ble_tick();
+
     if (!ota_is_pending_verify())
     {
         return;
@@ -827,7 +865,7 @@ _Noreturn void app_main()
     ota_init();
 
     g_ble_cmd_queue = xQueueCreate(8, sizeof(ble_command_t));
-    ble_service_init(g_ble_cmd_queue);
+    ble_service_init(g_ble_cmd_queue, ota_ble_write);
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();

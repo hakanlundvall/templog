@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
@@ -27,6 +29,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -41,12 +44,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.hakanlundvall.templog.FirmwareTransfer
 import io.github.hakanlundvall.templog.ReleaseCheck
 import io.github.hakanlundvall.templog.TemplogViewModel
 import io.github.hakanlundvall.templog.ble.ConnectionState
@@ -54,6 +59,7 @@ import io.github.hakanlundvall.templog.ble.HeaterForceState
 import io.github.hakanlundvall.templog.ble.OtaState
 import io.github.hakanlundvall.templog.ble.SensorReading
 import io.github.hakanlundvall.templog.ble.Telemetry
+import io.github.hakanlundvall.templog.update.FirmwareRelease
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -69,6 +75,7 @@ fun TemplogScreen(
     val error by viewModel.lastError.collectAsStateWithLifecycle()
     val busy by viewModel.busy.collectAsStateWithLifecycle()
     val releaseCheck by viewModel.releaseCheck.collectAsStateWithLifecycle()
+    val transfer by viewModel.transfer.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(Unit) {
@@ -142,9 +149,10 @@ fun TemplogScreen(
                         FirmwareCard(
                             telemetry = snapshot,
                             releaseCheck = releaseCheck,
+                            transfer = transfer,
                             enabled = state == ConnectionState.READY && !busy,
                             onCheck = viewModel::checkForFirmwareUpdate,
-                            onInstall = { tag -> dialog = Dialog.Firmware(tag) },
+                            onInstall = { release -> dialog = Dialog.Firmware(release) },
                         )
                     }
                     item {
@@ -201,12 +209,17 @@ fun TemplogScreen(
         )
 
         is Dialog.Firmware -> FirmwareDialog(
-            tag = current.tag,
+            release = current.release,
             installed = telemetry?.firmwareVersion,
+            deviceOnline = telemetry?.wifiConnected == true,
             onDismiss = { dialog = null },
-            onConfirm = {
+            onConfirm = { overBle ->
                 dialog = null
-                viewModel.installFirmware(current.tag)
+                if (overBle) {
+                    viewModel.installFirmwareOverBle(current.release)
+                } else {
+                    viewModel.installFirmware(current.release.tag)
+                }
             },
         )
 
@@ -218,7 +231,7 @@ private sealed interface Dialog {
     data object Wifi : Dialog
     data object Mqtt : Dialog
     data object Thresholds : Dialog
-    data class Firmware(val tag: String) : Dialog
+    data class Firmware(val release: FirmwareRelease) : Dialog
 }
 
 @Composable
@@ -480,9 +493,10 @@ private fun MqttDialog(
 private fun FirmwareCard(
     telemetry: Telemetry,
     releaseCheck: ReleaseCheck,
+    transfer: FirmwareTransfer?,
     enabled: Boolean,
     onCheck: () -> Unit,
-    onInstall: (String) -> Unit,
+    onInstall: (FirmwareRelease) -> Unit,
 ) {
     val installed = telemetry.firmwareVersion
     val ota = telemetry.ota
@@ -513,7 +527,23 @@ private fun FirmwareCard(
                 },
             )
 
-            if (ota != null) {
+            if (transfer != null) {
+                Text(
+                    when (transfer) {
+                        is FirmwareTransfer.Downloading ->
+                            "Downloading to the phone: ${transfer.bytes / 1024} of " +
+                                "${transfer.total / 1024} kB"
+                        is FirmwareTransfer.Sending ->
+                            "Sending over Bluetooth: ${transfer.bytes / 1024} of " +
+                                "${transfer.total / 1024} kB"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                LinearProgressIndicator(
+                    progress = { transfer.fraction },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else if (ota != null) {
                 val target = ota.version?.let { " $it" }.orEmpty()
                 when (ota.state) {
                     OtaState.DOWNLOADING -> {
@@ -529,6 +559,18 @@ private fun FirmwareCard(
                             )
                         } else {
                             LinearProgressIndicator(Modifier.fillMaxWidth())
+                        }
+                    }
+                    OtaState.RECEIVING -> {
+                        Text(
+                            "Receiving over Bluetooth" + (ota.percent?.let { " – $it %" } ?: "…"),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        ota.percent?.let { percent ->
+                            LinearProgressIndicator(
+                                progress = { percent / 100f },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
                         }
                     }
                     OtaState.REBOOTING -> Text(
@@ -565,7 +607,7 @@ private fun FirmwareCard(
                     modifier = Modifier.weight(1f),
                 ) { Text("Check") }
                 FilledTonalButton(
-                    onClick = { latest?.let { onInstall(it.tag) } },
+                    onClick = { latest?.let(onInstall) },
                     enabled = enabled && latest != null && ota != null && !ota.inProgress &&
                         ota.state != OtaState.VERIFYING && latest.tag != installed,
                     modifier = Modifier.weight(1f),
@@ -582,26 +624,82 @@ private fun FirmwareCard(
 
 @Composable
 private fun FirmwareDialog(
-    tag: String,
+    release: FirmwareRelease,
     installed: String?,
+    deviceOnline: Boolean,
     onDismiss: () -> Unit,
-    onConfirm: () -> Unit,
+    onConfirm: (overBle: Boolean) -> Unit,
 ) {
+    // Over Wi-Fi the device fetches the image itself, which is much faster, so
+    // it is the default whenever the device is actually online.
+    var overBle by remember { mutableStateOf(!deviceOnline) }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Install firmware $tag?") },
+        title = { Text("Install firmware ${release.tag}?") },
         text = {
-            Text(
-                "The device downloads $tag from GitHub over its own Wi-Fi" +
-                    (installed?.let { ", replacing $it," } ?: "") +
-                    " and then restarts. The heater is off for the few seconds the " +
-                    "restart takes. If the new firmware cannot reach Wi-Fi within two " +
-                    "minutes, the device goes back to the current version.",
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "${release.tag} replaces " + (installed ?: "the running firmware") +
+                        ". The device restarts once the image is in place, and the heater " +
+                        "is off for the few seconds that takes. If the new firmware cannot " +
+                        "reach Wi-Fi within two minutes, the device goes back to the " +
+                        "current version.",
+                )
+                Column(Modifier.selectableGroup()) {
+                    TransferOption(
+                        selected = !overBle,
+                        enabled = deviceOnline,
+                        title = "Over Wi-Fi",
+                        subtitle = if (deviceOnline) {
+                            "The device downloads it from GitHub, about a minute."
+                        } else {
+                            "Unavailable: the device is not on Wi-Fi."
+                        },
+                        onSelect = { overBle = false },
+                    )
+                    TransferOption(
+                        selected = overBle,
+                        enabled = true,
+                        title = "Over Bluetooth",
+                        subtitle = "This phone downloads it and sends it to the device, " +
+                            "a few minutes. Keep the app open and stay nearby.",
+                        onSelect = { overBle = true },
+                    )
+                }
+            }
         },
-        confirmButton = { TextButton(onClick = onConfirm) { Text("Install") } },
+        confirmButton = { TextButton(onClick = { onConfirm(overBle) }) { Text("Install") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+@Composable
+private fun TransferOption(
+    selected: Boolean,
+    enabled: Boolean,
+    title: String,
+    subtitle: String,
+    onSelect: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onSelect)
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(selected = selected, onClick = null, enabled = enabled)
+        Spacer(Modifier.width(8.dp))
+        Column {
+            Text(title, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

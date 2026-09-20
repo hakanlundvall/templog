@@ -19,6 +19,8 @@ typedef enum {
     /* The running image was just installed and has not been confirmed yet. */
     OTA_STATE_VERIFYING,
     OTA_STATE_DOWNLOADING,
+    /* An image is arriving over BLE from a phone instead of over Wi-Fi. */
+    OTA_STATE_RECEIVING,
     /* The release is the version already running; nothing was written. */
     OTA_STATE_UP_TO_DATE,
     /* The new image is written and selected for boot. */
@@ -58,6 +60,28 @@ void ota_rollback_if_pending(void);
 bool ota_start(const char *tag, bool force, const char **error);
 
 void ota_get_status(ota_status_t *out);
+
+/* Receiving an image over BLE, for a device with no usable Wi-Fi. The phone
+ * downloads the release itself and pushes it here in order.
+ *
+ * ota_ble_begin() opens a session, chunks are written at increasing offsets,
+ * and ota_ble_end() validates the image and selects it for the next boot; the
+ * caller reboots. A session is dropped if a chunk arrives out of order, if the
+ * CRC does not match, or if it stalls (see ota_ble_tick). */
+bool ota_ble_begin(uint32_t size, uint32_t crc32, const char *version, bool force, const char **error);
+
+/* Writes the next chunk. Returns false once the session has been dropped; the
+ * reason is in the status, since a chunk write carries no reply. Called from
+ * the BLE host task. */
+bool ota_ble_write(uint32_t offset, const uint8_t *data, size_t len);
+
+/* Finishes the session and selects the new image for boot. */
+bool ota_ble_end(const char **error);
+
+void ota_ble_abort(void);
+
+/* Drops a session that has gone quiet. Call periodically. */
+void ota_ble_tick(void);
 
 const char *ota_state_name(ota_state_t state);
 

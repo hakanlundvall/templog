@@ -110,9 +110,14 @@ current heater thresholds and `forceState` is `0` (automatic), `1` (forced
 off until start conditions are met again) or `2` (forced off until
 explicitly started).
 
+Firmware can also be pushed straight to the device over BLE by the Android
+app, for a device whose Wi-Fi is not working; `templogctl` only triggers the
+Wi-Fi download.
+
 `fw` is the version of the running firmware. `ota` describes a firmware
 update: `state` is one of `idle`, `downloading` (with `pct` progress),
 `rebooting`, `uptodate` (the release is the version already running),
+`receiving` (an image arriving over BLE, also with `pct`),
 `failed` (with `err`) or `verifying` (a freshly installed image that is
 rolled back unless it reaches Wi-Fi within two minutes). `ver` is the
 version being installed once known.

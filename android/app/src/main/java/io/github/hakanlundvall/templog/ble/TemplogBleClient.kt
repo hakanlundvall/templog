@@ -113,6 +113,9 @@ class TemplogBleClient(context: Context) {
 
     private var bondReceiverRegistered = false
 
+    /** Negotiated ATT MTU, which decides how large a firmware chunk can be. */
+    private var mtu = DEFAULT_MTU
+
     // ---------------------------------------------------------------- lifecycle
 
     /** Starts (or restarts) the connect/reconnect loop. Safe to call repeatedly. */
@@ -201,6 +204,56 @@ class TemplogBleClient(context: Context) {
         } catch (e: TimeoutCancellationException) {
             handler.post { pendingCommands[cmd]?.remove(deferred) }
             throw CommandException("timed out waiting for status reply to $cmd")
+        }
+    }
+
+    /**
+     * Pushes a whole firmware image to the device, chunk by chunk, after an
+     * ota_ble_begin command has been accepted. Each chunk carries its offset,
+     * so the device notices at once if one goes missing.
+     *
+     * Chunks go out as writes without response, but still one at a time
+     * through the GATT queue: the completion callback is what paces the
+     * transfer, and it is also what reports a link that has gone away.
+     * [onProgress] is called with the number of bytes accepted so far.
+     */
+    suspend fun sendFirmware(image: ByteArray, onProgress: (Int) -> Unit) {
+        val payloadSize = (mtu - ATT_WRITE_OVERHEAD - Protocol.FIRMWARE_CHUNK_HEADER)
+            .coerceIn(MIN_CHUNK_PAYLOAD, Protocol.FIRMWARE_CHUNK_MAX - Protocol.FIRMWARE_CHUNK_HEADER)
+
+        var offset = 0
+        while (offset < image.size) {
+            if (_connectionState.value != ConnectionState.READY) {
+                throw CommandException("lost the connection after $offset of ${image.size} bytes")
+            }
+            val length = minOf(payloadSize, image.size - offset)
+            val chunk = ByteArray(Protocol.FIRMWARE_CHUNK_HEADER + length)
+            chunk[0] = (offset and 0xFF).toByte()
+            chunk[1] = ((offset ushr 8) and 0xFF).toByte()
+            chunk[2] = ((offset ushr 16) and 0xFF).toByte()
+            chunk[3] = ((offset ushr 24) and 0xFF).toByte()
+            image.copyInto(chunk, Protocol.FIRMWARE_CHUNK_HEADER, offset, offset + length)
+
+            val written = CompletableDeferred<Unit>()
+            handler.post {
+                enqueue(
+                    Op.Write(
+                        uuid = Protocol.FIRMWARE_CHAR_UUID,
+                        value = chunk,
+                        noResponse = true,
+                        onSuccess = { written.complete(Unit) },
+                        onFailure = { reason -> written.completeExceptionally(CommandException(reason)) },
+                    ),
+                )
+            }
+            try {
+                withTimeout(CHUNK_TIMEOUT_MS) { written.await() }
+            } catch (e: TimeoutCancellationException) {
+                throw CommandException("timed out sending firmware at $offset bytes")
+            }
+
+            offset += length
+            onProgress(offset)
         }
     }
 
@@ -362,6 +415,8 @@ class TemplogBleClient(context: Context) {
         class Write(
             val uuid: UUID,
             val value: ByteArray,
+            val noResponse: Boolean = false,
+            val onSuccess: (() -> Unit)? = null,
             val onFailure: ((String) -> Unit)? = null,
         ) : Op {
             override fun toString(): String = "Write($uuid, ${value.size} bytes)"
@@ -405,6 +460,10 @@ class TemplogBleClient(context: Context) {
         if (op is Op.Write) op.onFailure?.invoke(reason)
     }
 
+    private fun succeedOp(op: Op?) {
+        if (op is Op.Write) op.onSuccess?.invoke()
+    }
+
     private fun characteristic(uuid: UUID): BluetoothGattCharacteristic? =
         gatt?.getService(Protocol.SERVICE_UUID)?.getCharacteristic(uuid)
 
@@ -426,16 +485,17 @@ class TemplogBleClient(context: Context) {
 
     private fun write(gatt: BluetoothGatt, op: Op.Write): Boolean {
         val characteristic = characteristic(op.uuid) ?: return false
+        val type = if (op.noResponse) {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        }
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeCharacteristic(
-                characteristic,
-                op.value,
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-            ) == BluetoothStatusCodes.SUCCESS
+            gatt.writeCharacteristic(characteristic, op.value, type) == BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {
-                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                characteristic.writeType = type
                 characteristic.value = op.value
                 gatt.writeCharacteristic(characteristic)
             }
@@ -494,6 +554,7 @@ class TemplogBleClient(context: Context) {
             handler.post {
                 if (g !== gatt) return@post
                 Log.i(TAG, "mtu=$mtu status=$status")
+                if (status == BluetoothGatt.GATT_SUCCESS) this@TemplogBleClient.mtu = mtu
                 opComplete()
                 if (!g.discoverServices()) {
                     _lastError.value = "service discovery could not be started"
@@ -571,6 +632,8 @@ class TemplogBleClient(context: Context) {
                 }
                 if (status != BluetoothGatt.GATT_SUCCESS && op != null) {
                     failOp(op, "write rejected by device (status $status)")
+                } else {
+                    succeedOp(op)
                 }
                 opComplete()
             }
@@ -730,6 +793,12 @@ class TemplogBleClient(context: Context) {
         private const val MIN_BACKOFF_MS = 1_000L
         private const val MAX_BACKOFF_MS = 30_000L
         private const val SCAN_TIMEOUT_MS = 10_000L
+        private const val DEFAULT_MTU = 23
+
+        /** ATT opcode plus attribute handle, which every write carries. */
+        private const val ATT_WRITE_OVERHEAD = 3
+        private const val MIN_CHUNK_PAYLOAD = 16
+        private const val CHUNK_TIMEOUT_MS = 10_000L
         const val COMMAND_TIMEOUT_MS = 10_000L
 
         /** The firmware asks for 247; requesting the maximum lets it win. */

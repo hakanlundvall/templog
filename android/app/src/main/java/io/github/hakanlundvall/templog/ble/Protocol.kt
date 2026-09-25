@@ -101,15 +101,17 @@ object Protocol {
             .put("max", maxC)
 
     /**
-     * What the actuator does: [travelS] is its end to end run time and
-     * [authorityC] the supply temperature span that full travel covers.
-     * Whether control is running is left alone.
+     * How a correction is made: the actuator runs for [burstMs], then waits
+     * [pauseS] for the supply sensor to answer, repeating while the supply
+     * temperature is further than [toleranceC] from the setpoint. Whether
+     * control is running is left alone.
      */
-    fun setActuator(travelS: Int, authorityC: Double): JSONObject =
+    fun setActuator(burstMs: Int, pauseS: Int, toleranceC: Double): JSONObject =
         JSONObject()
             .put("cmd", CMD_SET_SHUNT)
-            .put("travel", travelS)
-            .put("authority", authorityC)
+            .put("burst", burstMs)
+            .put("pause", pauseS)
+            .put("tol", toleranceC)
 
     /** Switches shunt control on or off, leaving every other setting alone. */
     fun setShuntEnabled(enabled: Boolean): JSONObject =
@@ -131,7 +133,7 @@ object Protocol {
             .put("indoorMax", maxTrimC)
             .put("indoorStale", staleS)
 
-    /** Runs the actuator by hand, for checking the wiring and timing its travel. */
+    /** Runs the actuator by hand, for checking which way it is wired. */
     fun shuntJog(dir: ShuntDirection, ms: Int): JSONObject =
         JSONObject()
             .put("cmd", CMD_SHUNT_JOG)
@@ -287,15 +289,21 @@ data class ShuntStatus(
     /** The measured supply temperature, null when that sensor has never been read. */
     val supplyC: Double?,
     val outdoorC: Double?,
-    /** 0 = fully cold, 1 = fully warm. An estimate from run time, not a measurement. */
-    val position: Double,
+    /**
+     * Corrections made in a row without the direction changing: positive
+     * towards warmer, negative towards colder, zero while the supply
+     * temperature is inside the tolerance. A count that keeps climbing means
+     * the valve is against an end stop, or the boiler cannot deliver.
+     */
+    val bursts: Int,
     val slope: Double,
     val offsetC: Double,
     val targetC: Double,
     val minSupplyC: Double,
     val maxSupplyC: Double,
-    val travelS: Int,
-    val authorityC: Double,
+    val burstMs: Int,
+    val pauseS: Int,
+    val toleranceC: Double,
 ) {
     val holding: Boolean
         get() = state == "holding"
@@ -426,6 +434,7 @@ data class Telemetry(
             val wifi = root.optJSONObject("wifi")
             val mqtt = root.optJSONObject("mqtt")
             val curve = root.optJSONObject("curve")
+            val act = root.optJSONObject("act")
             val ota = root.optJSONObject("ota")
             val shunt = root.optJSONObject("shunt")
             val indoor = root.optJSONObject("indoor")
@@ -470,14 +479,15 @@ data class Telemetry(
                         setpointC = if (it.has("sp")) it.getDouble("sp") else null,
                         supplyC = if (it.has("sup")) it.getDouble("sup") else null,
                         outdoorC = if (it.has("out")) it.getDouble("out") else null,
-                        position = it.optDouble("pos", 0.0),
+                        bursts = it.optInt("bursts", 0),
                         slope = curve?.optDouble("slope", 1.0) ?: 1.0,
                         offsetC = curve?.optDouble("offset", 0.0) ?: 0.0,
                         targetC = curve?.optDouble("target", 21.0) ?: 21.0,
                         minSupplyC = curve?.optDouble("min", 20.0) ?: 20.0,
                         maxSupplyC = curve?.optDouble("max", 70.0) ?: 70.0,
-                        travelS = curve?.optInt("travel", 120) ?: 120,
-                        authorityC = curve?.optDouble("authority", 50.0) ?: 50.0,
+                        burstMs = act?.optInt("burst", 1000) ?: 1000,
+                        pauseS = act?.optInt("pause", 10) ?: 10,
+                        toleranceC = act?.optDouble("tol", 1.0) ?: 1.0,
                     )
                 },
                 indoor = indoor?.let {

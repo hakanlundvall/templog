@@ -86,11 +86,11 @@ templogctl heater-off --until-started # stays off until an explicit heater-on
 templogctl heater-on                  # starts heater unless water temp already >= off-threshold
 
 templogctl set-curve --slope 1.2 --offset -1 --target 21 --min 20 --max 70
-templogctl set-shunt --on --travel 120 --authority 50
+templogctl set-shunt --on --burst 1000 --pause 10 --tolerance 1.0
 templogctl set-shunt --off             # stop driving the valve, leaving it where it is
 templogctl set-indoor --topic home/livingroom/temperature --gain 3 --max-trim 5 --stale 900
 templogctl set-indoor --topic ""       # switch the indoor trim off
-templogctl shunt-jog warmer 5          # run the actuator by hand, to check the wiring
+templogctl shunt-jog warmer 5          # run the actuator by hand, to check which way it is wired
 
 templogctl ota-update                 # install the latest GitHub release over the ESP32's Wi-Fi
 templogctl ota-update --tag v1.2.0    # install a specific release
@@ -125,13 +125,13 @@ sensors on the bus. `templog-ble` reads all three and merges them, so
     "forceState": 0,
     "shunt": {
       "en": true, "state": "running", "dir": "idle",
-      "sp": 44.6, "sup": 43.9, "out": 1.4, "pos": 0.42,
+      "sp": 44.6, "sup": 43.9, "out": 1.4, "bursts": -2,
       "in": 20.8, "inAge": 42000, "inFresh": true, "trim": 0.6
     },
     "curve": {
-      "slope": 1.2, "offset": -1.0, "target": 21.0, "min": 20.0, "max": 70.0,
-      "travel": 120, "authority": 50.0
+      "slope": 1.2, "offset": -1.0, "target": 21.0, "min": 20.0, "max": 70.0
     },
+    "act": {"burst": 1000, "pause": 10, "tol": 1.0},
     "indoor": {
       "topic": "home/livingroom/temperature", "gain": 3.0, "maxTrim": 5.0, "stale": 900
     },
@@ -166,20 +166,28 @@ point actuator on the radiator shunt valve: one makes it travel towards warmer,
 the other towards colder, and with neither energised it stays put. They are
 never energised at once.
 
-Control is open loop with respect to the house, like the panel it replaces. A
-heating curve turns the outdoor temperature into a supply ("framledning")
-temperature setpoint:
+The valve mixes the water coming back from the radiator circuit with hot water
+from the boiler. Control is open loop with respect to the house, like the panel
+it replaces: a heating curve turns the outdoor temperature into a supply
+("framledning") temperature setpoint:
 
     supply = target + slope × (target − outdoor) + offset + trim
 
 clamped to `min`..`max`. The loop that *is* closed is the one around the supply
-sensor: every 20 seconds the actuator is pulsed for a time proportional to the
-difference between setpoint and measured supply temperature. Because the
-actuator integrates those pulses, the supply temperature settles on the
-setpoint without a standing error. `travel` (its end to end run time) and
-`authority` (how much supply temperature that whole travel is worth) are what
-turn a temperature error into a pulse length; `shunt-jog` is there to measure
-the first and try out the second.
+sensor, and it is deliberately crude. The actuator reports no position, and
+even if it did, how much supply temperature a given movement is worth changes
+with the boiler temperature on the other side of the mixer — so nothing here
+tries to know where the valve stands or how far to move it. While the supply
+temperature is further than `tol` from the setpoint, the actuator is run for
+`burst` milliseconds in the direction that corrects it, then left alone for
+`pause` seconds so the pipe sensor can show what that burst did. Then it looks
+again. Too short a pause is what makes a valve like this hunt.
+
+Corrections are therefore slow on purpose: a large error is walked off one
+burst at a time. `bursts` counts how many have been made in a row in the same
+direction — positive towards warmer, negative towards colder — and a count that
+keeps climbing means the valve has run into an end stop or the boiler cannot
+deliver what the curve is asking for.
 
 `trim` comes from the indoor temperature, which this device does not measure:
 it subscribes to `indoorTopic` on the broker and expects a bare number. The
@@ -190,13 +198,10 @@ than leaving the house cold.
 
 The valve is held where it is, rather than driven blind, whenever the outdoor
 or supply reading is missing or more than two minutes old; `state` is then
-`holding` and `why` says which. `pos` is an estimate of how far the valve is
-open, integrated from run time rather than measured, and is only reported —
-the control loop follows the supply temperature, so a drifted estimate cannot
-stop the valve from reaching either end.
+`holding` and `why` says which.
 
 The controller also mirrors itself onto MQTT as retained messages:
-`temp/1/shunt/state`, `temp/1/shunt/setpoint` and `temp/1/shunt/position`.
+`temp/1/shunt/state`, `temp/1/shunt/setpoint` and `temp/1/shunt/bursts`.
 
 `set-mqtt` restarts the ESP32's MQTT client against the new broker straight
 away and only persists the URL once the client accepts it, so a URL the client

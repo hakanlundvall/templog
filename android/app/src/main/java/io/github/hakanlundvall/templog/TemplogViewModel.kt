@@ -90,8 +90,8 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
     fun setCurve(slope: Double, offsetC: Double, targetC: Double, minC: Double, maxC: Double) =
         issue("Heating curve updated", Protocol.setCurve(slope, offsetC, targetC, minC, maxC))
 
-    fun setActuator(travelS: Int, authorityC: Double) =
-        issue("Actuator settings updated", Protocol.setActuator(travelS, authorityC))
+    fun setActuator(burstMs: Int, pauseS: Int, toleranceC: Double) =
+        issue("Correction settings updated", Protocol.setActuator(burstMs, pauseS, toleranceC))
 
     fun setShuntEnabled(enabled: Boolean) = issue(
         if (enabled) "Shunt control started" else "Shunt control stopped",

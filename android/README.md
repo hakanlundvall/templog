@@ -19,8 +19,8 @@ Bluetooth Low Energy, shows live telemetry, and sends the same set of commands.
   the MQTT broker URL and whether it is connected, heater on/off, the on/off
   thresholds and the current force-off mode, and what the shunt valve control
   is doing: the supply temperature it is aiming for, the one it measures, how
-  far the valve is thought to be open, and whether the indoor reading is fresh
-  enough to be trimming the curve.
+  many corrections in a row it has needed, and whether the indoor reading is
+  fresh enough to be trimming the curve.
 * **Controls the device.** Start the heater, force it off (either until the
   start conditions are met again or until explicitly started), change the
   thresholds, say what each sensor is for, set the Wi-Fi credentials, and point
@@ -28,9 +28,10 @@ Bluetooth Low Energy, shows live telemetry, and sends the same set of commands.
 * **Adjusts the heating curve.** The slope and parallel offset that turn the
   outdoor temperature into a supply temperature, the indoor target the curve
   pivots about, and the supply limits — the same dials as the panel this
-  replaces, with a preview of what the curve asks for at +5 and −15 °C. The
-  actuator's travel time and authority are set here too, and the valve can be
-  run by hand in either direction to check the wiring and time its travel.
+  replaces, with a preview of what the curve asks for at +5 and −15 °C. How
+  each correction is made — burst length, the pause after it and the tolerance
+  — is set here too, and the valve can be run by hand in either direction to
+  check which way it is wired.
 * **Survives a bad link.** Disconnects re-enter the connect loop with
   exponential backoff (1s doubling to 30s), matching the Pi service.
 

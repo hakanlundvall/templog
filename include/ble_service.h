@@ -55,14 +55,16 @@ typedef struct {
     float shunt_setpoint_c;   /* NAN while it cannot be computed */
     float shunt_supply_c;     /* NAN when the supply sensor has never been read */
     float shunt_outdoor_c;    /* NAN when the outdoor sensor has never been read */
-    float shunt_position;     /* 0 = fully cold, 1 = fully warm; an estimate */
+    /* Bursts made in a row in one direction, positive towards warmer. */
+    int16_t shunt_bursts;
     float curve_slope;
     float curve_offset_c;
     float curve_target_c;
     float curve_min_supply_c;
     float curve_max_supply_c;
-    uint16_t actuator_travel_s;
-    float actuator_authority_c;
+    uint16_t burst_ms;
+    uint16_t pause_s;
+    float tolerance_c;
     /* Indoor temperature, which arrives over MQTT rather than from a sensor. */
     char indoor_topic[BLE_MQTT_TOPIC_LEN];
     float indoor_c;          /* NAN when nothing has been received */
@@ -130,8 +132,9 @@ typedef struct {
             float room_target_c;
             float min_supply_c;
             float max_supply_c;
-            uint16_t travel_s;
-            float authority_c;
+            uint16_t burst_ms;
+            uint16_t pause_s;
+            float tolerance_c;
             float indoor_gain;
             float indoor_max_c;
             uint16_t indoor_stale_s;

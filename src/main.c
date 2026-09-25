@@ -479,7 +479,7 @@ static void publish_heater_state(void)
 
 #define SHUNT_STATE_TOPIC "temp/1/shunt/state"
 #define SHUNT_SETPOINT_TOPIC "temp/1/shunt/setpoint"
-#define SHUNT_POSITION_TOPIC "temp/1/shunt/position"
+#define SHUNT_BURSTS_TOPIC "temp/1/shunt/bursts"
 
 /* Mirrors what the shunt controller is doing onto MQTT, retained, so Home
  * Assistant can graph the setpoint next to the measured supply temperature.
@@ -489,7 +489,7 @@ static void publish_shunt_state(void)
 {
     static char last_state[16];
     static int last_setpoint_decic = INT32_MIN;
-    static int last_position_pct = -1;
+    static int last_bursts = 0;
 
     esp_mqtt_client_handle_t client = g_mqtt_client;
     if (client == NULL || !s_mqtt_connected)
@@ -501,7 +501,7 @@ static void publish_shunt_state(void)
     shunt_get_status(&status);
     const char *state = shunt_state_name(status.state);
     int setpoint_decic = isnan(status.setpoint_c) ? INT32_MIN : (int)lroundf(status.setpoint_c * 10.0f);
-    int position_pct = (int)lroundf(status.position * 100.0f);
+    int bursts = status.bursts;
 
     if (strcmp(state, last_state) != 0)
     {
@@ -521,17 +521,17 @@ static void publish_shunt_state(void)
         }
         last_setpoint_decic = setpoint_decic;
     }
-    /* Only once the valve has stopped: publishing every percent while the
-     * actuator runs would put a retained message on the broker every tick. */
-    if (position_pct != last_position_pct && status.dir == SHUNT_DIR_IDLE)
+    /* How many corrections in a row it has needed, so a valve sitting against
+     * an end stop, or a boiler that cannot keep up, shows up on a graph. */
+    if (bursts != last_bursts)
     {
         char buf[10];
-        int len = snprintf(buf, sizeof(buf), "%d", position_pct);
-        if (len > 0 && esp_mqtt_client_publish(client, SHUNT_POSITION_TOPIC, buf, len, 1, 1) < 0)
+        int len = snprintf(buf, sizeof(buf), "%d", bursts);
+        if (len > 0 && esp_mqtt_client_publish(client, SHUNT_BURSTS_TOPIC, buf, len, 1, 1) < 0)
         {
             return;
         }
-        last_position_pct = position_pct;
+        last_bursts = bursts;
     }
 }
 
@@ -819,8 +819,9 @@ static void process_ble_commands(void)
             cfg.room_target_c = cmd.data.shunt.room_target_c;
             cfg.min_supply_c = cmd.data.shunt.min_supply_c;
             cfg.max_supply_c = cmd.data.shunt.max_supply_c;
-            cfg.travel_s = cmd.data.shunt.travel_s;
-            cfg.authority_c = cmd.data.shunt.authority_c;
+            cfg.burst_ms = cmd.data.shunt.burst_ms;
+            cfg.pause_s = cmd.data.shunt.pause_s;
+            cfg.tolerance_c = cmd.data.shunt.tolerance_c;
             cfg.indoor_gain = cmd.data.shunt.indoor_gain;
             cfg.indoor_max_c = cmd.data.shunt.indoor_max_c;
             cfg.indoor_stale_s = cmd.data.shunt.indoor_stale_s;
@@ -1009,14 +1010,15 @@ static void publish_telemetry(void)
     telemetry.shunt_setpoint_c = shunt.setpoint_c;
     telemetry.shunt_supply_c = shunt.supply_c;
     telemetry.shunt_outdoor_c = shunt.outdoor_c;
-    telemetry.shunt_position = shunt.position;
+    telemetry.shunt_bursts = shunt.bursts;
     telemetry.curve_slope = shunt_cfg.slope;
     telemetry.curve_offset_c = shunt_cfg.offset_c;
     telemetry.curve_target_c = shunt_cfg.room_target_c;
     telemetry.curve_min_supply_c = shunt_cfg.min_supply_c;
     telemetry.curve_max_supply_c = shunt_cfg.max_supply_c;
-    telemetry.actuator_travel_s = shunt_cfg.travel_s;
-    telemetry.actuator_authority_c = shunt_cfg.authority_c;
+    telemetry.burst_ms = shunt_cfg.burst_ms;
+    telemetry.pause_s = shunt_cfg.pause_s;
+    telemetry.tolerance_c = shunt_cfg.tolerance_c;
     strlcpy(telemetry.indoor_topic, indoor_topic, sizeof(telemetry.indoor_topic));
     telemetry.indoor_c = shunt.indoor_c;
     telemetry.indoor_age_ms = shunt.indoor_age_ms;

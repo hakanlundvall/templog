@@ -258,10 +258,11 @@ static void handle_command_json(const char *json, size_t len)
             out.data.shunt.room_target_c = opt_float(root, "target");
             out.data.shunt.min_supply_c = opt_float(root, "min");
             out.data.shunt.max_supply_c = opt_float(root, "max");
-            out.data.shunt.authority_c = opt_float(root, "authority");
+            out.data.shunt.tolerance_c = opt_float(root, "tol");
             out.data.shunt.indoor_gain = opt_float(root, "indoorGain");
             out.data.shunt.indoor_max_c = opt_float(root, "indoorMax");
-            out.data.shunt.travel_s = opt_u16(root, "travel");
+            out.data.shunt.burst_ms = opt_u16(root, "burst");
+            out.data.shunt.pause_s = opt_u16(root, "pause");
             out.data.shunt.indoor_stale_s = opt_u16(root, "indoorStale");
             if (cJSON_IsString(topic)) {
                 out.data.shunt.set_indoor_topic = true;
@@ -719,7 +720,7 @@ void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
     if (!isnan(telemetry->shunt_outdoor_c)) {
         add_rounded(shunt, "out", telemetry->shunt_outdoor_c, 1);
     }
-    add_rounded(shunt, "pos", telemetry->shunt_position, 2);
+    cJSON_AddNumberToObject(shunt, "bursts", telemetry->shunt_bursts);
     /* The indoor reading lives here rather than in an object of its own: the
      * clients merge the three documents, and the settings document already
      * has an "indoor" object. */
@@ -757,8 +758,10 @@ void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
     add_rounded(curve, "target", telemetry->curve_target_c, 1);
     add_rounded(curve, "min", telemetry->curve_min_supply_c, 1);
     add_rounded(curve, "max", telemetry->curve_max_supply_c, 1);
-    cJSON_AddNumberToObject(curve, "travel", telemetry->actuator_travel_s);
-    add_rounded(curve, "authority", telemetry->actuator_authority_c, 1);
+    cJSON *act = cJSON_AddObjectToObject(config, "act");
+    cJSON_AddNumberToObject(act, "burst", telemetry->burst_ms);
+    cJSON_AddNumberToObject(act, "pause", telemetry->pause_s);
+    add_rounded(act, "tol", telemetry->tolerance_c, 1);
     cJSON *indoor_cfg = cJSON_AddObjectToObject(config, "indoor");
     cJSON_AddStringToObject(indoor_cfg, "topic", telemetry->indoor_topic);
     add_rounded(indoor_cfg, "gain", telemetry->indoor_gain, 2);

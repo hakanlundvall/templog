@@ -11,17 +11,25 @@ extern "C" {
 
 /* Weather compensated control of the radiator shunt valve.
  *
- * The valve is turned by a three point actuator: one output makes it travel
- * towards warmer (clockwise), the other towards colder, and with neither
- * energised it stays where it is. The two are never energised at once.
+ * The valve mixes the water coming back from the radiator circuit with hot
+ * water from the boiler. It is turned by a three point actuator: one output
+ * makes it travel towards warmer (clockwise), the other towards colder, and
+ * with neither energised it stays where it is. The two are never energised at
+ * once.
  *
  * Control is open loop with respect to the house: a heating curve turns the
  * outdoor temperature into a supply ("framledning") temperature setpoint,
  * exactly like the dials on the panel this replaces. The loop that is closed
- * is the one around the supply sensor - the actuator is pulsed until the
- * measured supply temperature matches the setpoint. Because the actuator
- * integrates the pulses, proportional pulse lengths are enough to settle
- * without a steady state error.
+ * is the one around the supply sensor.
+ *
+ * That loop is deliberately crude, and for a good reason: the actuator gives
+ * no position feedback, and even if it did, how much supply temperature a
+ * given movement is worth changes with the boiler temperature on the other
+ * side of the mixer. So nothing here tries to know where the valve is or how
+ * far to move it. While the supply temperature is outside a tolerance of the
+ * setpoint, the actuator is driven in short bursts in the direction that
+ * corrects it, with a pause between them for the supply sensor to catch up -
+ * and that is what stops it overshooting.
  *
  * An indoor temperature, which arrives over MQTT rather than from a DS18B20,
  * may trim the setpoint a few degrees either way. It is ignored whenever it is
@@ -53,8 +61,12 @@ typedef struct {
     float room_target_c; /* indoor setpoint, and the point the curve pivots about */
     float min_supply_c;
     float max_supply_c;
-    uint16_t travel_s;  /* actuator run time from end to end */
-    float authority_c;  /* supply temperature span of that full travel */
+    /* The correction: one burst this long, then a pause this long before the
+     * next decision, repeated while the supply temperature is further than
+     * tolerance_c from the setpoint. */
+    uint16_t burst_ms;
+    uint16_t pause_s;
+    float tolerance_c;
     float indoor_gain;  /* supply degrees per degree of indoor error */
     float indoor_max_c; /* clamp on the trim, in either direction */
     uint16_t indoor_stale_s; /* an indoor reading older than this is ignored */
@@ -72,7 +84,11 @@ typedef struct {
     uint32_t indoor_age_ms;  /* UINT32_MAX when never received */
     bool indoor_fresh;       /* false when the trim is being ignored */
     float indoor_trim_c;     /* what the indoor reading contributes to the setpoint */
-    float position;          /* 0 = fully cold, 1 = fully warm; an estimate from run time */
+    /* Bursts made in a row without the direction changing: positive towards
+     * warmer, negative towards colder, zero while the supply temperature is
+     * inside the tolerance. A count that keeps climbing is the sign of a valve
+     * that has reached an end stop, or of a boiler that cannot deliver. */
+    int16_t bursts;
     const char *reason;      /* static string; why it is holding, NULL while running */
 } shunt_status_t;
 
@@ -95,8 +111,8 @@ void shunt_report_supply(float celsius);
 void shunt_report_outdoor(float celsius);
 void shunt_report_indoor(float celsius);
 
-/* Runs the actuator for `ms` in one direction, for checking the wiring and for
- * measuring the travel time. Automatic control resumes afterwards. */
+/* Runs the actuator for `ms` in one direction, for checking which way it is
+ * wired. Automatic control resumes afterwards. */
 bool shunt_jog(shunt_dir_t dir, uint32_t ms, const char **error);
 
 const char *shunt_state_name(shunt_state_t state);

@@ -248,9 +248,9 @@ fun TemplogScreen(
         Dialog.Actuator -> ActuatorDialog(
             shunt = telemetry?.shunt,
             onDismiss = { dialog = null },
-            onConfirm = { travel, authority ->
+            onConfirm = { burst, pause, tolerance ->
                 dialog = null
-                viewModel.setActuator(travel, authority)
+                viewModel.setActuator(burst, pause, tolerance)
             },
         )
 
@@ -483,8 +483,7 @@ private fun ShuntCard(
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
-                "Outdoor " + (shunt.outdoorC?.formatC() ?: "—") +
-                    " · valve about ${(shunt.position * 100).toInt()}% open",
+                "Outdoor " + (shunt.outdoorC?.formatC() ?: "—") + " · " + burstSummary(shunt),
                 style = MaterialTheme.typography.bodySmall,
             )
             shunt.reason?.let {
@@ -521,16 +520,15 @@ private fun ShuntCard(
                     onClick = onEditActuator,
                     enabled = enabled,
                     modifier = Modifier.weight(1f),
-                ) { Text("Actuator") }
+                ) { Text("Bursts") }
                 OutlinedButton(
                     onClick = onEditIndoor,
                     enabled = enabled,
                     modifier = Modifier.weight(1f),
                 ) { Text("Indoor") }
             }
-            // Moving the valve by hand is how the wiring gets checked and how
-            // the travel time is measured, so it stays available while
-            // automatic control is switched off.
+            // Moving the valve by hand is how the wiring gets checked, so it
+            // stays available while automatic control is switched off.
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = { onJog(ShuntDirection.COLDER) },
@@ -671,49 +669,69 @@ private fun curvePreview(
     outdoor: Double,
 ): String = (target + slope * (target - outdoor) + offset).coerceIn(min, max).formatC()
 
+private fun burstSummary(shunt: ShuntStatus): String = when {
+    shunt.bursts > 0 -> "${shunt.bursts} correction${plural(shunt.bursts)} warmer in a row"
+    shunt.bursts < 0 -> "${-shunt.bursts} correction${plural(-shunt.bursts)} colder in a row"
+    else -> "within tolerance"
+}
+
+private fun plural(count: Int): String = if (count == 1) "" else "s"
+
 @Composable
 private fun ActuatorDialog(
     shunt: ShuntStatus?,
     onDismiss: () -> Unit,
-    onConfirm: (travelS: Int, authorityC: Double) -> Unit,
+    onConfirm: (burstMs: Int, pauseS: Int, toleranceC: Double) -> Unit,
 ) {
-    var travel by remember { mutableStateOf(shunt?.travelS?.toString().orEmpty()) }
-    var authority by remember { mutableStateOf(shunt?.authorityC?.formatPlain().orEmpty()) }
+    var burst by remember { mutableStateOf(shunt?.burstMs?.toString().orEmpty()) }
+    var pause by remember { mutableStateOf(shunt?.pauseS?.toString().orEmpty()) }
+    var tolerance by remember { mutableStateOf(shunt?.toleranceC?.formatPlain().orEmpty()) }
 
-    val travelValue = travel.trim().toIntOrNull()
-    val authorityValue = authority.toTemperature()
-    val valid = travelValue != null && travelValue in 5..600 &&
-        authorityValue != null && authorityValue > 0
+    val burstValue = burst.trim().toIntOrNull()
+    val pauseValue = pause.trim().toIntOrNull()
+    val toleranceValue = tolerance.toTemperature()
+    val valid = burstValue != null && burstValue in 100..30000 &&
+        pauseValue != null && pauseValue in 1..600 &&
+        toleranceValue != null && toleranceValue >= 0.1 && toleranceValue <= 10.0
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Actuator") },
+        title = { Text("Corrections") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "These two set how hard each correction pushes. Time the valve " +
-                        "from one end to the other with the jog buttons, and put in " +
-                        "roughly how much the supply temperature changes over that " +
-                        "whole travel.",
+                    "While the supply temperature is further than the tolerance from " +
+                        "what the curve asks for, the valve is nudged in short bursts " +
+                        "with a pause between them. The pause is what lets the pipe " +
+                        "sensor show what the last burst did, so too short a one makes " +
+                        "it overshoot and hunt.",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 OutlinedTextField(
-                    value = travel,
-                    onValueChange = { travel = it },
-                    label = { Text("Travel time, end to end (s)") },
+                    value = burst,
+                    onValueChange = { burst = it },
+                    label = { Text("Burst length (ms)") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
                 OutlinedTextField(
-                    value = authority,
-                    onValueChange = { authority = it },
-                    label = { Text("Supply span of that travel (°C)") },
+                    value = pause,
+                    onValueChange = { pause = it },
+                    label = { Text("Pause between bursts (s)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                OutlinedTextField(
+                    value = tolerance,
+                    onValueChange = { tolerance = it },
+                    label = { Text("Tolerance (°C)") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
                 if (!valid) {
                     Text(
-                        "Travel time must be 5–600 s and the span a positive number.",
+                        "Burst must be 100–30000 ms, pause 1–600 s and tolerance " +
+                            "0.1–10 °C.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
                     )
@@ -722,7 +740,7 @@ private fun ActuatorDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onConfirm(travelValue ?: 0, authorityValue ?: 0.0) },
+                onClick = { onConfirm(burstValue ?: 0, pauseValue ?: 0, toleranceValue ?: 0.0) },
                 enabled = valid,
             ) { Text("Apply") }
         },

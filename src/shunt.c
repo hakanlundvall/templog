@@ -19,16 +19,6 @@ static const char *TAG = "shunt";
 #define SHUNT_ACTIVE_LEVEL 1
 
 #define SHUNT_TICK_MS 100
-/* One correction per cycle, the rest of it spent waiting for the supply
- * temperature to catch up. A shunt loop takes tens of seconds to respond, so
- * correcting faster than this just makes the valve hunt. */
-#define SHUNT_CYCLE_MS 20000
-/* Shorter than this and the actuator barely moves, so it is not worth the
- * relay operation; the remaining error is taken care of next cycle. */
-#define SHUNT_MIN_PULSE_MS 400
-/* No single pulse may move the valve more than a quarter of its travel. */
-#define SHUNT_MAX_PULSE_FRACTION 4
-#define SHUNT_DEADBAND_C 0.4f
 /* A supply or outdoor reading older than this is treated as missing. Twice the
  * timeout the sampling loop uses before it cuts the heater, so a single slow
  * round of conversions does not stop the valve. */
@@ -40,8 +30,11 @@ static const char *TAG = "shunt";
 #define SHUNT_DEFAULT_ROOM_TARGET_C 21.0f
 #define SHUNT_DEFAULT_MIN_SUPPLY_C 20.0f
 #define SHUNT_DEFAULT_MAX_SUPPLY_C 70.0f
-#define SHUNT_DEFAULT_TRAVEL_S 120
-#define SHUNT_DEFAULT_AUTHORITY_C 50.0f
+/* Short enough that one burst cannot move the mixer far, and paused long
+ * enough for a DS18B20 clamped to the pipe to show what that burst did. */
+#define SHUNT_DEFAULT_BURST_MS 1000
+#define SHUNT_DEFAULT_PAUSE_S 10
+#define SHUNT_DEFAULT_TOLERANCE_C 1.0f
 #define SHUNT_DEFAULT_INDOOR_GAIN 3.0f
 #define SHUNT_DEFAULT_INDOOR_MAX_C 5.0f
 #define SHUNT_DEFAULT_INDOOR_STALE_S 900
@@ -56,8 +49,9 @@ static shunt_config_t s_cfg = {
     .room_target_c = SHUNT_DEFAULT_ROOM_TARGET_C,
     .min_supply_c = SHUNT_DEFAULT_MIN_SUPPLY_C,
     .max_supply_c = SHUNT_DEFAULT_MAX_SUPPLY_C,
-    .travel_s = SHUNT_DEFAULT_TRAVEL_S,
-    .authority_c = SHUNT_DEFAULT_AUTHORITY_C,
+    .burst_ms = SHUNT_DEFAULT_BURST_MS,
+    .pause_s = SHUNT_DEFAULT_PAUSE_S,
+    .tolerance_c = SHUNT_DEFAULT_TOLERANCE_C,
     .indoor_gain = SHUNT_DEFAULT_INDOOR_GAIN,
     .indoor_max_c = SHUNT_DEFAULT_INDOOR_MAX_C,
     .indoor_stale_s = SHUNT_DEFAULT_INDOOR_STALE_S,
@@ -76,18 +70,16 @@ static TickType_t s_indoor_tick;
 static shunt_dir_t s_dir = SHUNT_DIR_IDLE;
 static shunt_state_t s_state = SHUNT_STATE_OFF;
 static const char *s_reason = "control is switched off";
-static TickType_t s_pulse_end;
-static TickType_t s_cycle_start;
+static TickType_t s_burst_end;
+/* Nothing is decided before this: the pause after a burst is what lets the
+ * supply temperature answer it. */
+static TickType_t s_settled_at;
 static uint32_t s_jog_remaining_ms;
 static shunt_dir_t s_jog_dir = SHUNT_DIR_IDLE;
 static float s_setpoint_c = NAN;
 static float s_trim_c = 0.0f;
-/* Where the valve is thought to be, integrated from the time each output has
- * been energised. It starts in the middle because the real position is not
- * knowable without driving to an end stop, and it is only ever used for
- * reporting: the control loop follows the supply temperature, so an estimate
- * that has drifted cannot stop the valve from reaching either end. */
-static float s_position = 0.5f;
+/* Consecutive bursts in one direction; see shunt_status_t. */
+static int16_t s_bursts = 0;
 
 static float clampf(float value, float low, float high)
 {
@@ -215,8 +207,9 @@ static void run_jog(void)
     if (s_jog_remaining_ms == 0) {
         set_outputs(SHUNT_DIR_IDLE);
         s_jog_dir = SHUNT_DIR_IDLE;
-        /* Give the supply temperature the usual dwell before correcting. */
-        s_cycle_start = xTaskGetTickCount();
+        s_bursts = 0;
+        /* Let the supply temperature answer the jog before correcting it. */
+        s_settled_at = xTaskGetTickCount() + pdMS_TO_TICKS((uint32_t)s_cfg.pause_s * 1000);
     }
 }
 
@@ -226,17 +219,19 @@ static void run_auto(void)
 
     if (s_dir != SHUNT_DIR_IDLE) {
         /* Signed difference, so the comparison still holds when the tick
-         * counter wraps mid-pulse. */
-        if ((int32_t)(now - s_pulse_end) >= 0) {
+         * counter wraps mid-burst. */
+        if ((int32_t)(now - s_burst_end) >= 0) {
             set_outputs(SHUNT_DIR_IDLE);
+            s_settled_at = now + pdMS_TO_TICKS((uint32_t)s_cfg.pause_s * 1000);
         }
         return;
     }
 
-    if ((now - s_cycle_start) < pdMS_TO_TICKS(SHUNT_CYCLE_MS)) {
+    /* The pause after a burst. Deciding anything before the supply sensor has
+     * answered the last one is how a valve like this ends up hunting. */
+    if ((int32_t)(now - s_settled_at) < 0) {
         return;
     }
-    s_cycle_start = now;
 
     const char *reason = NULL;
     float setpoint = compute_setpoint(&reason);
@@ -265,33 +260,26 @@ static void run_auto(void)
     s_reason = NULL;
 
     float error = setpoint - s_supply_c;
-    if (fabsf(error) <= SHUNT_DEADBAND_C) {
+    if (fabsf(error) <= s_cfg.tolerance_c) {
+        s_bursts = 0;
         return;
     }
 
-    /* How far the valve has to travel for this much supply temperature, in
-     * time: the actuator integrates the pulses, so a proportional pulse each
-     * cycle settles on the setpoint without a standing error. */
-    float fraction = fabsf(error) / s_cfg.authority_c;
-    float pulse_ms = fraction * (float)s_cfg.travel_s * 1000.0f;
-    /* Never more than a quarter of the travel in one go, and never so long
-     * that the cycle ends with the valve still moving: what is left of the
-     * cycle is the dwell that lets the supply temperature answer before the
-     * next correction is worked out. */
-    float max_pulse_ms = (float)s_cfg.travel_s * 1000.0f / SHUNT_MAX_PULSE_FRACTION;
-    if (max_pulse_ms > SHUNT_CYCLE_MS / 2) {
-        max_pulse_ms = SHUNT_CYCLE_MS / 2;
-    }
-    if (pulse_ms < SHUNT_MIN_PULSE_MS) {
-        return;
-    }
-    pulse_ms = clampf(pulse_ms, SHUNT_MIN_PULSE_MS, max_pulse_ms);
-
+    /* One short burst, always the same length. How much supply temperature a
+     * given movement is worth depends on how hot the boiler side of the mixer
+     * is, so there is nothing to compute a proportional burst from; the next
+     * reading decides whether another one is needed. */
     shunt_dir_t dir = error > 0 ? SHUNT_DIR_WARMER : SHUNT_DIR_COLDER;
-    s_pulse_end = now + pdMS_TO_TICKS((uint32_t)pulse_ms);
+    if (dir == SHUNT_DIR_WARMER) {
+        s_bursts = s_bursts > 0 && s_bursts < INT16_MAX ? s_bursts + 1 : 1;
+    } else {
+        s_bursts = s_bursts < 0 && s_bursts > INT16_MIN ? s_bursts - 1 : -1;
+    }
+
+    s_burst_end = now + pdMS_TO_TICKS(s_cfg.burst_ms);
     set_outputs(dir);
-    ESP_LOGI(TAG, "supply %.1f -> %.1f C, driving %s for %d ms",
-             (double)s_supply_c, (double)setpoint, shunt_dir_name(dir), (int)pulse_ms);
+    ESP_LOGI(TAG, "supply %.1f -> %.1f C, burst %s (%d in a row)",
+             (double)s_supply_c, (double)setpoint, shunt_dir_name(dir), (int)s_bursts);
 }
 
 static void shunt_tick(void)
@@ -305,13 +293,9 @@ static void shunt_tick(void)
         s_state = SHUNT_STATE_OFF;
         s_reason = "control is switched off";
         s_setpoint_c = NAN;
+        s_bursts = 0;
     } else {
         run_auto();
-    }
-
-    if (s_dir != SHUNT_DIR_IDLE && s_cfg.travel_s > 0) {
-        float step = (SHUNT_TICK_MS / 1000.0f) / (float)s_cfg.travel_s;
-        s_position = clampf(s_position + (s_dir == SHUNT_DIR_WARMER ? step : -step), 0.0f, 1.0f);
     }
 
     xSemaphoreGive(s_mutex);
@@ -338,13 +322,17 @@ static void load_config(void)
     s_cfg.room_target_c = nvs_get_float("shTarget", SHUNT_DEFAULT_ROOM_TARGET_C);
     s_cfg.min_supply_c = nvs_get_float("shMin", SHUNT_DEFAULT_MIN_SUPPLY_C);
     s_cfg.max_supply_c = nvs_get_float("shMax", SHUNT_DEFAULT_MAX_SUPPLY_C);
-    s_cfg.authority_c = nvs_get_float("shAuth", SHUNT_DEFAULT_AUTHORITY_C);
+    s_cfg.tolerance_c = nvs_get_float("shTol", SHUNT_DEFAULT_TOLERANCE_C);
     s_cfg.indoor_gain = nvs_get_float("shIGain", SHUNT_DEFAULT_INDOOR_GAIN);
     s_cfg.indoor_max_c = nvs_get_float("shIMax", SHUNT_DEFAULT_INDOOR_MAX_C);
 
-    uint16_t travel = 0;
-    if (nvs_get_u16(s_nvs, "shTravel", &travel) == ESP_OK && travel > 0) {
-        s_cfg.travel_s = travel;
+    uint16_t burst = 0;
+    if (nvs_get_u16(s_nvs, "shBurst", &burst) == ESP_OK && burst > 0) {
+        s_cfg.burst_ms = burst;
+    }
+    uint16_t pause = 0;
+    if (nvs_get_u16(s_nvs, "shPause", &pause) == ESP_OK && pause > 0) {
+        s_cfg.pause_s = pause;
     }
     uint16_t stale = 0;
     if (nvs_get_u16(s_nvs, "shIStale", &stale) == ESP_OK && stale > 0) {
@@ -369,7 +357,7 @@ void shunt_init(nvs_handle_t nvs)
     gpio_set_level(SHUNT_GPIO_COLDER, !SHUNT_ACTIVE_LEVEL);
 
     load_config();
-    s_cycle_start = xTaskGetTickCount();
+    s_settled_at = xTaskGetTickCount();
     ESP_LOGI(TAG, "curve: %.1f C at target, slope %.2f, offset %.1f, limits %.0f-%.0f C, %s",
              (double)s_cfg.room_target_c, (double)s_cfg.slope, (double)s_cfg.offset_c,
              (double)s_cfg.min_supply_c, (double)s_cfg.max_supply_c,
@@ -415,10 +403,11 @@ bool shunt_set_config(const shunt_config_t *in, const char **error)
     next.room_target_c = pick_float(in->room_target_c, next.room_target_c);
     next.min_supply_c = pick_float(in->min_supply_c, next.min_supply_c);
     next.max_supply_c = pick_float(in->max_supply_c, next.max_supply_c);
-    next.authority_c = pick_float(in->authority_c, next.authority_c);
+    next.tolerance_c = pick_float(in->tolerance_c, next.tolerance_c);
     next.indoor_gain = pick_float(in->indoor_gain, next.indoor_gain);
     next.indoor_max_c = pick_float(in->indoor_max_c, next.indoor_max_c);
-    next.travel_s = pick_u16(in->travel_s, next.travel_s);
+    next.burst_ms = pick_u16(in->burst_ms, next.burst_ms);
+    next.pause_s = pick_u16(in->pause_s, next.pause_s);
     next.indoor_stale_s = pick_u16(in->indoor_stale_s, next.indoor_stale_s);
 
     if (!in_range(next.slope, 0.0f, 10.0f)) {
@@ -441,12 +430,16 @@ bool shunt_set_config(const shunt_config_t *in, const char **error)
         *error = "the minimum supply temperature must be below the maximum";
         return false;
     }
-    if (next.travel_s < 5 || next.travel_s > 600) {
-        *error = "actuator travel time must be between 5 and 600 s";
+    if (next.burst_ms < 100 || next.burst_ms > 30000) {
+        *error = "burst length must be between 100 and 30000 ms";
         return false;
     }
-    if (!in_range(next.authority_c, 5.0f, 100.0f)) {
-        *error = "valve authority must be between 5 and 100 C";
+    if (next.pause_s < 1 || next.pause_s > 600) {
+        *error = "pause must be between 1 and 600 s";
+        return false;
+    }
+    if (!in_range(next.tolerance_c, 0.1f, 10.0f)) {
+        *error = "tolerance must be between 0.1 and 10 C";
         return false;
     }
     if (!in_range(next.indoor_gain, 0.0f, 10.0f)) {
@@ -477,10 +470,11 @@ bool shunt_set_config(const shunt_config_t *in, const char **error)
     nvs_put_float("shTarget", next.room_target_c);
     nvs_put_float("shMin", next.min_supply_c);
     nvs_put_float("shMax", next.max_supply_c);
-    nvs_put_float("shAuth", next.authority_c);
+    nvs_put_float("shTol", next.tolerance_c);
     nvs_put_float("shIGain", next.indoor_gain);
     nvs_put_float("shIMax", next.indoor_max_c);
-    nvs_set_u16(s_nvs, "shTravel", next.travel_s);
+    nvs_set_u16(s_nvs, "shBurst", next.burst_ms);
+    nvs_set_u16(s_nvs, "shPause", next.pause_s);
     nvs_set_u16(s_nvs, "shIStale", next.indoor_stale_s);
     esp_err_t ret = nvs_commit(s_nvs);
     if (ret != ESP_OK) {
@@ -511,7 +505,7 @@ void shunt_get_status(shunt_status_t *out)
     out->indoor_fresh = out->indoor_age_ms != UINT32_MAX &&
                         out->indoor_age_ms <= (uint32_t)s_cfg.indoor_stale_s * 1000;
     out->indoor_trim_c = out->indoor_fresh ? s_trim_c : 0.0f;
-    out->position = s_position;
+    out->bursts = s_bursts;
     out->reason = s_reason;
     xSemaphoreGive(s_mutex);
 }

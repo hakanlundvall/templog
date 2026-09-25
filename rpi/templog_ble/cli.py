@@ -75,10 +75,13 @@ def cmd_set_shunt(args: argparse.Namespace) -> None:
     command = {"cmd": protocol.CMD_SET_SHUNT}
     if args.enabled is not None:
         command["enabled"] = args.enabled
-    if args.travel is not None:
-        command["travel"] = args.travel
-    if args.authority is not None:
-        command["authority"] = args.authority
+    for key, value in (
+        ("burst", args.burst),
+        ("pause", args.pause),
+        ("tol", args.tolerance),
+    ):
+        if value is not None:
+            command[key] = value
     _issue_command(args, command)
 
 
@@ -167,15 +170,16 @@ def main() -> None:
     p.add_argument("--max", type=float, help="Highest supply temperature the valve is driven to")
     p.set_defaults(func=cmd_set_curve)
 
-    p = sub.add_parser("set-shunt", help="Switch shunt control on or off and describe the actuator")
+    p = sub.add_parser("set-shunt", help="Switch shunt control on or off and tune how it corrects")
     group = p.add_mutually_exclusive_group()
     group.add_argument("--on", dest="enabled", action="store_true", default=None, help="Start controlling the valve")
     group.add_argument("--off", dest="enabled", action="store_false", default=None, help="Stop driving the valve")
-    p.add_argument("--travel", type=int, help="Seconds the actuator takes from end to end")
+    p.add_argument("--burst", type=int, help="Milliseconds the actuator runs for in one correction")
+    p.add_argument("--pause", type=int, help="Seconds to wait afterwards, for the supply sensor to answer")
     p.add_argument(
-        "--authority",
+        "--tolerance",
         type=float,
-        help="Supply temperature span of that full travel, in Celsius",
+        help="How far the supply temperature may sit from the setpoint before correcting, in Celsius",
     )
     p.set_defaults(func=cmd_set_shunt)
 
@@ -189,7 +193,7 @@ def main() -> None:
     p.add_argument("--stale", type=int, help="Seconds after which an indoor reading is ignored")
     p.set_defaults(func=cmd_set_indoor)
 
-    p = sub.add_parser("shunt-jog", help="Run the actuator by hand, to check the wiring or time its travel")
+    p = sub.add_parser("shunt-jog", help="Run the actuator by hand, to check which way it is wired")
     p.add_argument("direction", choices=(protocol.JOG_WARMER, protocol.JOG_COLDER))
     p.add_argument("seconds", type=float, help="How long to run it")
     p.set_defaults(func=cmd_shunt_jog)

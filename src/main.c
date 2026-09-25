@@ -23,10 +23,12 @@
 #include "mqtt_client.h"
 #include "freertos/queue.h"
 #include <math.h>
+#include <stdlib.h>
 #include <strings.h>
 
 #include "ble_service.h"
 #include "ota.h"
+#include "shunt.h"
 
 uint8_t ssid[32];
 uint8_t password[64];
@@ -45,7 +47,6 @@ static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "temp-logger";
 
 static int s_retry_num = 0;
-static uint32_t level2 = 0;
 static volatile bool s_wifi_connected = false;
 static volatile bool s_mqtt_connected = false;
 /* Written by the Wi-Fi event handler, read when building telemetry, so the
@@ -65,12 +66,31 @@ typedef enum {
     HEATER_FORCE_OFF_UNTIL_STARTED,
 } heater_force_state_t;
 
+/* What each DS18B20 is used for. The water sensor drives the heater
+ * thermostat; the outdoor and supply sensors feed the shunt controller, which
+ * cannot run without both of them. A sensor holds at most one role. */
+typedef enum {
+    SENSOR_ROLE_NONE = -1,
+    SENSOR_ROLE_WATER = 0,
+    SENSOR_ROLE_OUTDOOR,
+    SENSOR_ROLE_SUPPLY,
+    SENSOR_ROLE_COUNT,
+} sensor_role_t;
+
+static const char *const role_names[SENSOR_ROLE_COUNT] = {"water", "outdoor", "supply"};
+/* NVS keys, in the same order. "waterRom" predates the other two. */
+static const char *const role_keys[SENSOR_ROLE_COUNT] = {"waterRom", "outRom", "supRom"};
+
+/* The ROM code assigned to each role, empty when the role is unassigned, and
+ * the index it resolves to in device_rom_codes - which stays -1 while the
+ * sensor is not on the bus, so a role can be set before the sensor is wired. */
+static char role_rom[SENSOR_ROLE_COUNT][BLE_ROM_CODE_HEX_LEN + 1];
+static int role_index[SENSOR_ROLE_COUNT] = {-1, -1, -1};
+
 static nvs_handle_t g_nvs_handle;
 static QueueHandle_t g_ble_cmd_queue;
 static OneWireBus_ROMCode device_rom_codes[8];
 static int num_devices = 0;
-static int water_sensor_index = -1;
-static bool water_sensor_persisted = false;
 static bool heater_on = false;
 static float last_water_temp = NAN;
 static heater_force_state_t heater_force_state = HEATER_FORCE_NONE;
@@ -97,6 +117,65 @@ static bool has_mqtt_config(void)
     return url[0] != '\0';
 }
 
+/* The indoor temperature is not measured by this device. Something else on the
+ * network publishes it, so the shunt controller gets it by subscribing to this
+ * topic; empty means the indoor trim is switched off. */
+static char indoor_topic[BLE_MQTT_TOPIC_LEN];
+
+static bool has_indoor_topic(void)
+{
+    return indoor_topic[0] != '\0';
+}
+
+static sensor_role_t role_from_name(const char *name)
+{
+    for (int i = 0; i < SENSOR_ROLE_COUNT; ++i)
+    {
+        if (strcasecmp(name, role_names[i]) == 0)
+        {
+            return (sensor_role_t)i;
+        }
+    }
+    return SENSOR_ROLE_NONE;
+}
+
+/* The role a sensor on the bus currently holds, for telemetry. */
+static sensor_role_t role_of_sensor(int index)
+{
+    for (int i = 0; i < SENSOR_ROLE_COUNT; ++i)
+    {
+        if (role_index[i] == index)
+        {
+            return (sensor_role_t)i;
+        }
+    }
+    return SENSOR_ROLE_NONE;
+}
+
+static int find_sensor_index(const char *rom_code_hex)
+{
+    for (int i = 0; i < num_devices; ++i)
+    {
+        char rom_code_s[BLE_ROM_CODE_HEX_LEN + 1];
+        owb_string_from_rom_code(device_rom_codes[i], rom_code_s, sizeof(rom_code_s));
+        if (strcasecmp(rom_code_s, rom_code_hex) == 0)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Matches the stored ROM codes against the sensors actually found on the bus.
+ * Called after the 1-Wire search and whenever an assignment changes. */
+static void resolve_role_indexes(void)
+{
+    for (int i = 0; i < SENSOR_ROLE_COUNT; ++i)
+    {
+        role_index[i] = role_rom[i][0] != '\0' ? find_sensor_index(role_rom[i]) : -1;
+    }
+}
+
 static void log_error_if_nonzero(const char *message, int error_code)
 {
     if (error_code != 0)
@@ -117,10 +196,6 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             esp_wifi_connect();
         }
     }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED)
-    {
-        level2 = 0;
-    }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
@@ -130,7 +205,6 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         s_wifi_last_disc_tick = xTaskGetTickCount();
         s_wifi_disconnect_count++;
         ESP_LOGW(TAG, "Wi-Fi disconnected, reason %d, rssi %d", event->reason, event->rssi);
-        level2 = 1;
         if (s_retry_num < MAXIMUM_RETRY)
         {
             esp_wifi_connect();
@@ -236,6 +310,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         s_heater_state_dirty = true;
         // esp_mqtt_client_publish(event->client, "temp/1/status", "connected", 0, 1, 0);
 
+        /* Subscriptions do not survive a reconnect, so the indoor topic is
+         * taken again every time the session comes back. */
+        if (has_indoor_topic())
+        {
+            esp_mqtt_client_subscribe(event->client, indoor_topic, 0);
+            ESP_LOGI(TAG, "Subscribed to indoor temperature topic %s", indoor_topic);
+        }
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -255,6 +336,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
         printf("DATA=%.*s\r\n", event->data_len, event->data);
+        /* The indoor temperature, if this is it. A payload is a bare number;
+         * anything else is dropped, so the reading simply goes stale and the
+         * curve carries the heating on its own. */
+        if (has_indoor_topic() &&
+            (size_t)event->topic_len == strlen(indoor_topic) &&
+            strncmp(event->topic, indoor_topic, event->topic_len) == 0)
+        {
+            char payload[32];
+            if ((size_t)event->data_len < sizeof(payload))
+            {
+                memcpy(payload, event->data, event->data_len);
+                payload[event->data_len] = '\0';
+                char *end = NULL;
+                float value = strtof(payload, &end);
+                if (end != payload && isfinite(value))
+                {
+                    shunt_report_indoor(value);
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "Ignoring unparsable indoor temperature '%s'", payload);
+                }
+            }
+        }
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
@@ -370,6 +475,64 @@ static void publish_heater_state(void)
     last_on = heater_on;
     last_mode = heater_force_state;
     s_heater_state_dirty = false;
+}
+
+#define SHUNT_STATE_TOPIC "temp/1/shunt/state"
+#define SHUNT_SETPOINT_TOPIC "temp/1/shunt/setpoint"
+#define SHUNT_POSITION_TOPIC "temp/1/shunt/position"
+
+/* Mirrors what the shunt controller is doing onto MQTT, retained, so Home
+ * Assistant can graph the setpoint next to the measured supply temperature.
+ * Like the heater state, only changes are sent, and nothing at all while the
+ * broker is unreachable. */
+static void publish_shunt_state(void)
+{
+    static char last_state[16];
+    static int last_setpoint_decic = INT32_MIN;
+    static int last_position_pct = -1;
+
+    esp_mqtt_client_handle_t client = g_mqtt_client;
+    if (client == NULL || !s_mqtt_connected)
+    {
+        return;
+    }
+
+    shunt_status_t status;
+    shunt_get_status(&status);
+    const char *state = shunt_state_name(status.state);
+    int setpoint_decic = isnan(status.setpoint_c) ? INT32_MIN : (int)lroundf(status.setpoint_c * 10.0f);
+    int position_pct = (int)lroundf(status.position * 100.0f);
+
+    if (strcmp(state, last_state) != 0)
+    {
+        if (esp_mqtt_client_publish(client, SHUNT_STATE_TOPIC, state, 0, 1, 1) < 0)
+        {
+            return;
+        }
+        strlcpy(last_state, state, sizeof(last_state));
+    }
+    if (setpoint_decic != last_setpoint_decic && setpoint_decic != INT32_MIN)
+    {
+        char buf[10];
+        int len = snprintf(buf, sizeof(buf), "%.1f", (double)status.setpoint_c);
+        if (len > 0 && esp_mqtt_client_publish(client, SHUNT_SETPOINT_TOPIC, buf, len, 1, 1) < 0)
+        {
+            return;
+        }
+        last_setpoint_decic = setpoint_decic;
+    }
+    /* Only once the valve has stopped: publishing every percent while the
+     * actuator runs would put a retained message on the broker every tick. */
+    if (position_pct != last_position_pct && status.dir == SHUNT_DIR_IDLE)
+    {
+        char buf[10];
+        int len = snprintf(buf, sizeof(buf), "%d", position_pct);
+        if (len > 0 && esp_mqtt_client_publish(client, SHUNT_POSITION_TOPIC, buf, len, 1, 1) < 0)
+        {
+            return;
+        }
+        last_position_pct = position_pct;
+    }
 }
 
 static void connection_monitor_task(void *arg)
@@ -506,6 +669,27 @@ static bool apply_mqtt_config(const char **error)
     return true;
 }
 
+/* Moves the indoor subscription onto whatever `indoor_topic` now holds. The
+ * previous topic is dropped first, so a renamed sensor stops feeding the
+ * controller instead of quietly competing with the new one. */
+static void apply_indoor_topic(const char *previous)
+{
+    esp_mqtt_client_handle_t client = g_mqtt_client;
+    if (client == NULL || !s_mqtt_connected)
+    {
+        /* Nothing to move: the subscription is taken on the next connect. */
+        return;
+    }
+    if (previous != NULL && previous[0] != '\0')
+    {
+        esp_mqtt_client_unsubscribe(client, previous);
+    }
+    if (has_indoor_topic())
+    {
+        esp_mqtt_client_subscribe(client, indoor_topic, 0);
+    }
+}
+
 /* The force-off state lives in NVS so that a heater stopped over BLE stays
  * stopped across a reboot instead of silently reverting to automatic control. */
 static void set_heater_force_state(heater_force_state_t state)
@@ -573,35 +757,112 @@ static void process_ble_commands(void)
             ble_service_report_status("set_mqtt", true, NULL);
             break;
         }
-        case BLE_CMD_SET_WATER_SENSOR:
+        case BLE_CMD_SET_SENSOR_ROLE:
         {
-            int idx = -1;
-            for (int i = 0; i < num_devices; ++i)
+            const char *reply = cmd.data.sensor_role.cmd;
+            const char *id = cmd.data.sensor_role.rom_code_hex;
+            sensor_role_t role = role_from_name(cmd.data.sensor_role.role);
+            if (role == SENSOR_ROLE_NONE && strcasecmp(cmd.data.sensor_role.role, "none") != 0)
             {
-                char rom_code_s[17];
-                owb_string_from_rom_code(device_rom_codes[i], rom_code_s, sizeof(rom_code_s));
-                if (strcasecmp(rom_code_s, cmd.data.water_sensor.rom_code_hex) == 0)
+                ble_service_report_status(reply, false, "role must be water, outdoor, supply or none");
+                break;
+            }
+
+            /* A sensor does one job at a time, so taking it for this role
+             * releases it from whichever one it held before. */
+            for (int i = 0; i < SENSOR_ROLE_COUNT; ++i)
+            {
+                if (strcasecmp(role_rom[i], id) == 0)
                 {
-                    idx = i;
-                    break;
+                    role_rom[i][0] = '\0';
+                    nvs_set_str(g_nvs_handle, role_keys[i], "");
                 }
             }
-            nvs_set_str(g_nvs_handle, "waterRom", cmd.data.water_sensor.rom_code_hex);
-            nvs_commit(g_nvs_handle);
-            water_sensor_persisted = true;
-            water_sensor_index = idx;
-            last_water_temp = NAN;
-            if (idx < 0)
+            if (role != SENSOR_ROLE_NONE)
             {
-                ESP_LOGW(TAG, "Water sensor %s not currently present; will apply once seen",
-                         cmd.data.water_sensor.rom_code_hex);
-                ble_service_report_status("set_water_sensor", true, "sensor not currently present; stored for later");
+                strlcpy(role_rom[role], id, sizeof(role_rom[role]));
+                nvs_set_str(g_nvs_handle, role_keys[role], role_rom[role]);
+            }
+            nvs_commit(g_nvs_handle);
+            resolve_role_indexes();
+            last_water_temp = NAN;
+
+            if (role == SENSOR_ROLE_NONE)
+            {
+                ESP_LOGI(TAG, "Sensor %s no longer has a role", id);
+                ble_service_report_status(reply, true, NULL);
+            }
+            else if (role_index[role] < 0)
+            {
+                ESP_LOGW(TAG, "Sensor %s is not on the bus; the %s role is stored for later",
+                         id, role_names[role]);
+                ble_service_report_status(reply, true, "sensor not currently present; stored for later");
             }
             else
             {
-                ESP_LOGI(TAG, "Water sensor set to %s (index %d)", cmd.data.water_sensor.rom_code_hex, idx);
-                ble_service_report_status("set_water_sensor", true, NULL);
+                ESP_LOGI(TAG, "Sensor %s is now the %s sensor (index %d)", id, role_names[role],
+                         role_index[role]);
+                ble_service_report_status(reply, true, NULL);
             }
+            break;
+        }
+        case BLE_CMD_SET_SHUNT:
+        {
+            shunt_config_t cfg;
+            shunt_get_config(&cfg);
+            if (cmd.data.shunt.enabled >= 0)
+            {
+                cfg.enabled = cmd.data.shunt.enabled != 0;
+            }
+            cfg.slope = cmd.data.shunt.slope;
+            cfg.offset_c = cmd.data.shunt.offset_c;
+            cfg.room_target_c = cmd.data.shunt.room_target_c;
+            cfg.min_supply_c = cmd.data.shunt.min_supply_c;
+            cfg.max_supply_c = cmd.data.shunt.max_supply_c;
+            cfg.travel_s = cmd.data.shunt.travel_s;
+            cfg.authority_c = cmd.data.shunt.authority_c;
+            cfg.indoor_gain = cmd.data.shunt.indoor_gain;
+            cfg.indoor_max_c = cmd.data.shunt.indoor_max_c;
+            cfg.indoor_stale_s = cmd.data.shunt.indoor_stale_s;
+
+            const char *error = NULL;
+            if (!shunt_set_config(&cfg, &error))
+            {
+                ble_service_report_status("set_shunt", false, error);
+                break;
+            }
+
+            if (cmd.data.shunt.set_indoor_topic)
+            {
+                char previous[sizeof(indoor_topic)];
+                strlcpy(previous, indoor_topic, sizeof(previous));
+                strlcpy(indoor_topic, cmd.data.shunt.indoor_topic, sizeof(indoor_topic));
+                nvs_set_str(g_nvs_handle, "indTopic", indoor_topic);
+                nvs_commit(g_nvs_handle);
+                apply_indoor_topic(previous);
+                ESP_LOGI(TAG, "Indoor temperature topic set to '%s'", indoor_topic);
+            }
+            ble_service_report_status("set_shunt", true, NULL);
+            break;
+        }
+        case BLE_CMD_SHUNT_JOG:
+        {
+            shunt_dir_t dir = SHUNT_DIR_IDLE;
+            if (strcasecmp(cmd.data.jog.dir, "warmer") == 0)
+            {
+                dir = SHUNT_DIR_WARMER;
+            }
+            else if (strcasecmp(cmd.data.jog.dir, "colder") == 0)
+            {
+                dir = SHUNT_DIR_COLDER;
+            }
+            const char *error = NULL;
+            if (!shunt_jog(dir, cmd.data.jog.ms, &error))
+            {
+                ble_service_report_status("shunt_jog", false, error);
+                break;
+            }
+            ble_service_report_status("shunt_jog", true, NULL);
             break;
         }
         case BLE_CMD_SET_THRESHOLDS:
@@ -713,7 +974,8 @@ static void publish_telemetry(void)
         telemetry.readings[i].age_ms = ever_good[i]
                                             ? (uint32_t)((xTaskGetTickCount() - last_good_reading[i]) * portTICK_PERIOD_MS)
                                             : UINT32_MAX;
-        telemetry.readings[i].is_water_sensor = (i == water_sensor_index);
+        sensor_role_t role = role_of_sensor(i);
+        telemetry.readings[i].role = role == SENSOR_ROLE_NONE ? NULL : role_names[role];
     }
     telemetry.wifi_connected = s_wifi_connected;
     strlcpy(telemetry.wifi_ssid, (char *)ssid, sizeof(telemetry.wifi_ssid));
@@ -735,6 +997,35 @@ static void publish_telemetry(void)
     telemetry.heater_on_threshold_c = heater_on_threshold;
     telemetry.heater_off_threshold_c = heater_off_threshold;
     telemetry.heater_force_state = (int)heater_force_state;
+
+    shunt_config_t shunt_cfg;
+    shunt_status_t shunt;
+    shunt_get_config(&shunt_cfg);
+    shunt_get_status(&shunt);
+    telemetry.shunt_enabled = shunt_cfg.enabled;
+    telemetry.shunt_state = shunt_state_name(shunt.state);
+    telemetry.shunt_dir = shunt_dir_name(shunt.dir);
+    telemetry.shunt_reason = shunt.reason;
+    telemetry.shunt_setpoint_c = shunt.setpoint_c;
+    telemetry.shunt_supply_c = shunt.supply_c;
+    telemetry.shunt_outdoor_c = shunt.outdoor_c;
+    telemetry.shunt_position = shunt.position;
+    telemetry.curve_slope = shunt_cfg.slope;
+    telemetry.curve_offset_c = shunt_cfg.offset_c;
+    telemetry.curve_target_c = shunt_cfg.room_target_c;
+    telemetry.curve_min_supply_c = shunt_cfg.min_supply_c;
+    telemetry.curve_max_supply_c = shunt_cfg.max_supply_c;
+    telemetry.actuator_travel_s = shunt_cfg.travel_s;
+    telemetry.actuator_authority_c = shunt_cfg.authority_c;
+    strlcpy(telemetry.indoor_topic, indoor_topic, sizeof(telemetry.indoor_topic));
+    telemetry.indoor_c = shunt.indoor_c;
+    telemetry.indoor_age_ms = shunt.indoor_age_ms;
+    telemetry.indoor_fresh = shunt.indoor_fresh;
+    telemetry.indoor_trim_c = shunt.indoor_trim_c;
+    telemetry.indoor_gain = shunt_cfg.indoor_gain;
+    telemetry.indoor_max_c = shunt_cfg.indoor_max_c;
+    telemetry.indoor_stale_s = shunt_cfg.indoor_stale_s;
+
     strlcpy(telemetry.fw_version, ota_running_version(), sizeof(telemetry.fw_version));
     ota_status_t ota;
     ota_get_status(&ota);
@@ -772,15 +1063,16 @@ _Noreturn void app_main()
 {
     // Override global log level
     esp_log_level_set("*", ESP_LOG_INFO);
-    uint32_t level = 1;
     gpio_config_t io_conf = {};
 
     // disable interrupt
     io_conf.intr_type = GPIO_INTR_DISABLE;
     // set as output mode
     io_conf.mode = GPIO_MODE_OUTPUT;
-    // bit mask of the pins that you want to set,e.g.GPIO18/19
-    io_conf.pin_bit_mask = (1ULL << GPIO_NUM_27) | (1ULL << GPIO_NUM_18) | (1ULL << GPIO_NUM_19);
+    // bit mask of the pins that you want to set. GPIO18 and GPIO19 used to
+    // drive diagnostic LEDs; they now run the shunt actuator, and shunt_init()
+    // claims them.
+    io_conf.pin_bit_mask = (1ULL << GPIO_NUM_27);
     // disable pull-down mode
     io_conf.pull_down_en = 0;
     // disable pull-up mode
@@ -788,8 +1080,6 @@ _Noreturn void app_main()
     // configure GPIO with the given settings
     gpio_config(&io_conf);
     gpio_set_level(GPIO_HEATER, false);
-    gpio_set_level(GPIO_NUM_18, level2);
-    gpio_set_level(GPIO_NUM_19, !level);
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -841,12 +1131,23 @@ _Noreturn void app_main()
 
         g_nvs_handle = my_handle;
 
-        char water_rom[17] = {0};
-        size_t water_rom_len = sizeof(water_rom);
-        if (nvs_get_str(my_handle, "waterRom", water_rom, &water_rom_len) == ESP_OK && water_rom[0] != '\0')
+        for (int i = 0; i < SENSOR_ROLE_COUNT; ++i)
         {
-            water_sensor_persisted = true;
-            printf("Persisted water sensor: %s\n", water_rom);
+            size_t length = sizeof(role_rom[i]);
+            if (nvs_get_str(my_handle, role_keys[i], role_rom[i], &length) != ESP_OK)
+            {
+                role_rom[i][0] = '\0';
+            }
+            if (role_rom[i][0] != '\0')
+            {
+                printf("Persisted %s sensor: %s\n", role_names[i], role_rom[i]);
+            }
+        }
+
+        size_t topic_len = sizeof(indoor_topic);
+        if (nvs_get_str(my_handle, "indTopic", indoor_topic, &topic_len) != ESP_OK)
+        {
+            indoor_topic[0] = '\0';
         }
 
         int32_t on_centi = 0, off_centi = 0;
@@ -862,6 +1163,7 @@ _Noreturn void app_main()
         printf("Heater force state: %d\n", (int)heater_force_state);
     }
 
+    shunt_init(g_nvs_handle);
     ota_init();
 
     g_ble_cmd_queue = xQueueCreate(8, sizeof(ble_command_t));
@@ -905,23 +1207,20 @@ _Noreturn void app_main()
     }
     printf("Found %d device%s\n", num_devices, num_devices == 1 ? "" : "s");
 
-    if (water_sensor_persisted)
+    resolve_role_indexes();
+    for (int i = 0; i < SENSOR_ROLE_COUNT; ++i)
     {
-        char water_rom[17] = {0};
-        size_t water_rom_len = sizeof(water_rom);
-        if (nvs_get_str(g_nvs_handle, "waterRom", water_rom, &water_rom_len) == ESP_OK)
+        if (role_rom[i][0] == '\0')
         {
-            for (int i = 0; i < num_devices; ++i)
-            {
-                char rom_code_s[17];
-                owb_string_from_rom_code(device_rom_codes[i], rom_code_s, sizeof(rom_code_s));
-                if (strcasecmp(rom_code_s, water_rom) == 0)
-                {
-                    water_sensor_index = i;
-                    ESP_LOGI(TAG, "Persisted water sensor %s found at index %d", water_rom, i);
-                    break;
-                }
-            }
+            continue;
+        }
+        if (role_index[i] >= 0)
+        {
+            ESP_LOGI(TAG, "%s sensor %s found at index %d", role_names[i], role_rom[i], role_index[i]);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "%s sensor %s is not on the bus", role_names[i], role_rom[i]);
         }
     }
 
@@ -1000,7 +1299,7 @@ _Noreturn void app_main()
             {
                 has_good_temp_reading = true;
                 last_good_temp_reading = xTaskGetTickCount();
-                if (water_sensor_index < 0 && !water_sensor_persisted)
+                if (role_index[SENSOR_ROLE_WATER] < 0 && role_rom[SENSOR_ROLE_WATER][0] == '\0')
                 {
                     heater_on = (heater_force_state == HEATER_FORCE_NONE);
                 }
@@ -1017,14 +1316,28 @@ _Noreturn void app_main()
                 ever_good[i] = true;
                 last_good_value[i] = readings[i];
 
-                if (water_sensor_index < 0 && !water_sensor_persisted && readings[i] >= WATER_TEMP_IDENTIFICATION_THRESHOLD)
+                /* The shunt controller runs in its own task and only needs the
+                 * two readings it regulates on. */
+                if (i == role_index[SENSOR_ROLE_OUTDOOR])
                 {
-                    water_sensor_index = i;
+                    shunt_report_outdoor(readings[i]);
+                }
+                if (i == role_index[SENSOR_ROLE_SUPPLY])
+                {
+                    shunt_report_supply(readings[i]);
+                }
+
+                if (role_index[SENSOR_ROLE_WATER] < 0 && role_rom[SENSOR_ROLE_WATER][0] == '\0' &&
+                    readings[i] >= WATER_TEMP_IDENTIFICATION_THRESHOLD)
+                {
+                    /* Not persisted: this is a guess from the temperature
+                     * itself, which a later assignment from the app replaces. */
+                    role_index[SENSOR_ROLE_WATER] = i;
                     heater_on = false;
                     ESP_LOGI(TAG, "Sensor %d identified as water temperature; heater off at %.1f C", i, readings[i]);
                 }
 
-                if (i == water_sensor_index)
+                if (i == role_index[SENSOR_ROLE_WATER])
                 {
                     last_water_temp = readings[i];
                     bool want_on = heater_on;
@@ -1076,6 +1389,7 @@ _Noreturn void app_main()
 
             publish_telemetry();
             publish_heater_state();
+            publish_shunt_state();
             check_pending_firmware();
 
             // Print results in a separate loop, after all have been read
@@ -1123,9 +1437,6 @@ _Noreturn void app_main()
             }
             current++;
             current %= AVG_COUNT;
-            level = level ? 0 : 1;
-            gpio_set_level(GPIO_NUM_18, level2);
-            gpio_set_level(GPIO_NUM_19, !level);
 
             vTaskDelayUntil(&last_wake_time, SAMPLE_PERIOD / portTICK_PERIOD_MS);
         }
@@ -1155,11 +1466,9 @@ _Noreturn void app_main()
 
         publish_telemetry();
         publish_heater_state();
+        publish_shunt_state();
         check_pending_firmware();
 
-        level = level ? 0 : 1;
-        gpio_set_level(GPIO_NUM_18, level2);
-        gpio_set_level(GPIO_NUM_19, !level);
         vTaskDelay(SAMPLE_PERIOD / portTICK_PERIOD_MS);
     }
 

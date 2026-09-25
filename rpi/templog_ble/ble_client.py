@@ -135,10 +135,14 @@ class BleClient:
                 # already bonded; this is not fatal.
                 logger.debug("pair() skipped/failed (may already be bonded): %s", exc)
 
-            await client.start_notify(protocol.TELEMETRY_CHAR_UUID, self._on_telemetry_notify)
+            await client.start_notify(protocol.TELEMETRY_CHAR_UUID, self._on_state_notify)
+            await client.start_notify(protocol.SENSORS_CHAR_UUID, self._on_sensors_notify)
+            await client.start_notify(protocol.CONFIG_CHAR_UUID, self._on_config_notify)
             await client.start_notify(protocol.STATUS_CHAR_UUID, self._on_status_notify)
 
-            # Prime state with an initial read rather than waiting for a notification.
+            # Prime state with initial reads rather than waiting for notifications.
+            # The settings characteristic in particular only notifies when it
+            # changes, so without this it would stay empty until it did.
             await self._read_telemetry()
 
             logger.info("Connected to %s", address)
@@ -147,21 +151,56 @@ class BleClient:
             while client.is_connected and not self._stop:
                 await asyncio.sleep(1)
 
-    async def _read_telemetry(self) -> None:
+    async def _read_document(self, uuid: str, what: str) -> Optional[dict]:
         try:
-            data = await self._client.read_gatt_char(protocol.TELEMETRY_CHAR_UUID)
-            telemetry = json.loads(bytes(data).decode("utf-8"))
+            data = await self._client.read_gatt_char(uuid)
+            return json.loads(bytes(data).decode("utf-8"))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("failed to read telemetry: %s", exc)
-            return
-        self.last_telemetry = telemetry
-        if self._on_telemetry is not None:
-            self._on_telemetry(telemetry)
+            logger.warning("failed to read %s: %s", what, exc)
+            return None
 
-    def _on_telemetry_notify(self, _handle: int, _data: bytearray) -> None:
-        # The notification payload itself is not authoritative (may be
-        # truncated); always re-read the full characteristic value.
-        asyncio.create_task(self._read_telemetry())
+    async def _read_telemetry(self, *uuids: str) -> None:
+        """Re-reads the named documents, or all of them, and republishes.
+
+        The device splits what it reports over three characteristics so that
+        no single value exceeds what a GATT client will read; they are merged
+        back into one telemetry dict here, which is what the rest of the
+        service and the CLI see.
+        """
+        wanted = uuids or (
+            protocol.TELEMETRY_CHAR_UUID,
+            protocol.SENSORS_CHAR_UUID,
+            protocol.CONFIG_CHAR_UUID,
+        )
+        names = {
+            protocol.TELEMETRY_CHAR_UUID: "state",
+            protocol.SENSORS_CHAR_UUID: "sensors",
+            protocol.CONFIG_CHAR_UUID: "config",
+        }
+        merged = dict(self.last_telemetry or {})
+        changed = False
+        for uuid in wanted:
+            document = await self._read_document(uuid, names[uuid])
+            if document is not None:
+                merged.update(document)
+                changed = True
+        if not changed:
+            return
+
+        self.last_telemetry = merged
+        if self._on_telemetry is not None:
+            self._on_telemetry(merged)
+
+    # The notification payload itself is not authoritative (it is a one byte
+    # placeholder); always re-read the characteristic that changed.
+    def _on_state_notify(self, _handle: int, _data: bytearray) -> None:
+        asyncio.create_task(self._read_telemetry(protocol.TELEMETRY_CHAR_UUID))
+
+    def _on_sensors_notify(self, _handle: int, _data: bytearray) -> None:
+        asyncio.create_task(self._read_telemetry(protocol.SENSORS_CHAR_UUID))
+
+    def _on_config_notify(self, _handle: int, _data: bytearray) -> None:
+        asyncio.create_task(self._read_telemetry(protocol.CONFIG_CHAR_UUID))
 
     def _on_status_notify(self, _handle: int, data: bytearray) -> None:
         try:

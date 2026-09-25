@@ -7,9 +7,15 @@ import java.util.UUID
  * Shared BLE protocol constants matching the ESP32 firmware (src/ble_service.c)
  * and the Raspberry Pi client (rpi/templog_ble/protocol.py).
  *
- * The GATT service exposes three characteristics:
- *  * TELEMETRY - read + notify. Value is a compact JSON document describing
- *                temperature sensors, Wi-Fi status and heater state.
+ * What the device reports is split over three read characteristics rather
+ * than one, because Android's GATT stack truncates a characteristic read at
+ * 512 bytes without saying so, and the sensor readings alone can approach
+ * that. The client reads all three and merges them into one [Telemetry].
+ *  * TELEMETRY - read + notify. Live state: Wi-Fi and MQTT connection, heater
+ *                output and mode, the shunt valve control, OTA progress.
+ *  * SENSORS   - read + notify. The DS18B20 readings and their roles.
+ *  * CONFIG    - read + notify. Settings, which only change on command, so
+ *                this one is notified only when something actually changed.
  *  * COMMAND   - write (with response). Body is a JSON command object.
  *  * STATUS    - read + notify. JSON {"cmd", "ok", "error"} describing the
  *                outcome of the most recently processed command.
@@ -25,6 +31,8 @@ object Protocol {
 
     val SERVICE_UUID: UUID = UUID.fromString("6e400000-b5a3-f393-e0a9-e50e24dcca9e")
     val TELEMETRY_CHAR_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+    val SENSORS_CHAR_UUID: UUID = UUID.fromString("6e400005-b5a3-f393-e0a9-e50e24dcca9e")
+    val CONFIG_CHAR_UUID: UUID = UUID.fromString("6e400006-b5a3-f393-e0a9-e50e24dcca9e")
     val COMMAND_CHAR_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
     val STATUS_CHAR_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
     val FIRMWARE_CHAR_UUID: UUID = UUID.fromString("6e400004-b5a3-f393-e0a9-e50e24dcca9e")
@@ -34,7 +42,7 @@ object Protocol {
 
     const val CMD_SET_WIFI = "set_wifi"
     const val CMD_SET_MQTT = "set_mqtt"
-    const val CMD_SET_WATER_SENSOR = "set_water_sensor"
+    const val CMD_SET_SENSOR_ROLE = "set_sensor_role"
     const val CMD_SET_THRESHOLDS = "set_thresholds"
     const val CMD_HEATER_OFF = "heater_off"
     const val CMD_HEATER_ON = "heater_on"
@@ -42,6 +50,8 @@ object Protocol {
     const val CMD_OTA_BLE_BEGIN = "ota_ble_begin"
     const val CMD_OTA_BLE_END = "ota_ble_end"
     const val CMD_OTA_BLE_ABORT = "ota_ble_abort"
+    const val CMD_SET_SHUNT = "set_shunt"
+    const val CMD_SHUNT_JOG = "shunt_jog"
 
     /** Bytes of offset that prefix every chunk on FIRMWARE_CHAR_UUID. */
     const val FIRMWARE_CHUNK_HEADER = 4
@@ -63,10 +73,70 @@ object Protocol {
             .put("cmd", CMD_SET_MQTT)
             .put("url", url)
 
-    fun setWaterSensor(romCodeHex: String): JSONObject =
+    /** Says what the sensor [romCodeHex] is used for; [SensorRole.NONE] frees it. */
+    fun setSensorRole(romCodeHex: String, role: SensorRole): JSONObject =
         JSONObject()
-            .put("cmd", CMD_SET_WATER_SENSOR)
+            .put("cmd", CMD_SET_SENSOR_ROLE)
             .put("id", romCodeHex)
+            .put("role", role.wire)
+
+    /**
+     * The heating curve, which turns the outdoor temperature into a supply
+     * temperature setpoint: supply = target + slope * (target - outdoor) +
+     * offset, clamped to [minC] .. [maxC].
+     */
+    fun setCurve(
+        slope: Double,
+        offsetC: Double,
+        targetC: Double,
+        minC: Double,
+        maxC: Double,
+    ): JSONObject =
+        JSONObject()
+            .put("cmd", CMD_SET_SHUNT)
+            .put("slope", slope)
+            .put("offset", offsetC)
+            .put("target", targetC)
+            .put("min", minC)
+            .put("max", maxC)
+
+    /**
+     * What the actuator does: [travelS] is its end to end run time and
+     * [authorityC] the supply temperature span that full travel covers.
+     * Whether control is running is left alone.
+     */
+    fun setActuator(travelS: Int, authorityC: Double): JSONObject =
+        JSONObject()
+            .put("cmd", CMD_SET_SHUNT)
+            .put("travel", travelS)
+            .put("authority", authorityC)
+
+    /** Switches shunt control on or off, leaving every other setting alone. */
+    fun setShuntEnabled(enabled: Boolean): JSONObject =
+        JSONObject()
+            .put("cmd", CMD_SET_SHUNT)
+            .put("enabled", enabled)
+
+    /**
+     * The indoor trim. The indoor temperature is not measured by the device:
+     * it subscribes to [topic], and ignores a reading older than [staleS]
+     * seconds so a silent sensor cannot leave the house cold. An empty topic
+     * switches the trim off.
+     */
+    fun setIndoor(topic: String, gain: Double, maxTrimC: Double, staleS: Int): JSONObject =
+        JSONObject()
+            .put("cmd", CMD_SET_SHUNT)
+            .put("indoorTopic", topic)
+            .put("indoorGain", gain)
+            .put("indoorMax", maxTrimC)
+            .put("indoorStale", staleS)
+
+    /** Runs the actuator by hand, for checking the wiring and timing its travel. */
+    fun shuntJog(dir: ShuntDirection, ms: Int): JSONObject =
+        JSONObject()
+            .put("cmd", CMD_SHUNT_JOG)
+            .put("dir", dir.wire)
+            .put("ms", ms)
 
     fun setThresholds(onC: Double, offC: Double): JSONObject =
         JSONObject()
@@ -159,6 +229,26 @@ data class OtaStatus(
             state == OtaState.REBOOTING
 }
 
+/** What a sensor is used for. A sensor holds at most one role. */
+enum class SensorRole(val wire: String, val label: String) {
+    NONE("none", "no role"),
+
+    /** Drives the heater thermostat. */
+    WATER("water", "water"),
+
+    /** Outdoor temperature, which the heating curve is drawn from. */
+    OUTDOOR("outdoor", "outdoor"),
+
+    /** Radiator supply temperature, the one the shunt valve regulates. */
+    SUPPLY("supply", "supply"),
+    ;
+
+    companion object {
+        fun fromWire(value: String?): SensorRole =
+            entries.firstOrNull { it.wire == value } ?: NONE
+    }
+}
+
 /** One DS18B20 reading as reported in the telemetry document's "t" array. */
 data class SensorReading(
     val id: String,
@@ -166,7 +256,64 @@ data class SensorReading(
     val celsius: Double?,
     /** Milliseconds since this sensor's last good reading, null if never read. */
     val ageMs: Long?,
-    val isWaterSensor: Boolean,
+    val role: SensorRole,
+)
+
+/** Which way the actuator is being driven right now. */
+enum class ShuntDirection(val wire: String) {
+    IDLE("idle"),
+
+    /** Clockwise: more hot water into the radiator circuit. */
+    WARMER("warmer"),
+    COLDER("colder"),
+    ;
+
+    companion object {
+        fun fromWire(value: String?): ShuntDirection =
+            entries.firstOrNull { it.wire == value } ?: IDLE
+    }
+}
+
+/** What the shunt controller is doing, mirroring the telemetry "shunt" object. */
+data class ShuntStatus(
+    val enabled: Boolean,
+    /** "off", "running", "holding" or "manual". */
+    val state: String,
+    val direction: ShuntDirection,
+    /** Why it is holding the valve where it is; null while it is regulating. */
+    val reason: String?,
+    /** The supply temperature the curve asks for, null while it cannot be computed. */
+    val setpointC: Double?,
+    /** The measured supply temperature, null when that sensor has never been read. */
+    val supplyC: Double?,
+    val outdoorC: Double?,
+    /** 0 = fully cold, 1 = fully warm. An estimate from run time, not a measurement. */
+    val position: Double,
+    val slope: Double,
+    val offsetC: Double,
+    val targetC: Double,
+    val minSupplyC: Double,
+    val maxSupplyC: Double,
+    val travelS: Int,
+    val authorityC: Double,
+) {
+    val holding: Boolean
+        get() = state == "holding"
+}
+
+/** The indoor temperature the device subscribes to, and how it trims the curve. */
+data class IndoorStatus(
+    /** Empty when no topic is configured, which switches the trim off. */
+    val topic: String,
+    val celsius: Double?,
+    val ageMs: Long?,
+    /** false when the reading is too old to be used, so the trim is ignored. */
+    val fresh: Boolean,
+    /** What the trim currently adds to the setpoint. */
+    val trimC: Double,
+    val gain: Double,
+    val maxTrimC: Double,
+    val staleS: Int,
 )
 
 /** How the heater is currently being overridden, mirroring "forceState". */
@@ -224,7 +371,7 @@ data class WifiDisconnect(
         }
 }
 
-/** A decoded telemetry snapshot. */
+/** A decoded snapshot, merged from the three documents the device publishes. */
 data class Telemetry(
     val sensors: List<SensorReading>,
     val wifiConnected: Boolean,
@@ -244,9 +391,13 @@ data class Telemetry(
     val firmwareVersion: String?,
     /** null on firmware without OTA support. */
     val ota: OtaStatus?,
+    /** null on firmware that does not control a shunt valve. */
+    val shunt: ShuntStatus?,
+    /** null on firmware that does not control a shunt valve. */
+    val indoor: IndoorStatus?,
 ) {
     val waterSensor: SensorReading?
-        get() = sensors.firstOrNull { it.isWaterSensor }
+        get() = sensors.firstOrNull { it.role == SensorRole.WATER }
 
     companion object {
         fun parse(json: String): Telemetry {
@@ -260,18 +411,28 @@ data class Telemetry(
                             id = item.optString("id"),
                             celsius = if (item.has("c")) item.getDouble("c") else null,
                             ageMs = if (item.has("age")) item.getLong("age") else null,
-                            isWaterSensor = item.optBoolean("water", false),
+                            role = if (item.has("role")) {
+                                SensorRole.fromWire(item.optString("role"))
+                            } else if (item.optBoolean("water", false)) {
+                                // Firmware from before roles existed.
+                                SensorRole.WATER
+                            } else {
+                                SensorRole.NONE
+                            },
                         ),
                     )
                 }
             }
             val wifi = root.optJSONObject("wifi")
             val mqtt = root.optJSONObject("mqtt")
+            val curve = root.optJSONObject("curve")
             val ota = root.optJSONObject("ota")
+            val shunt = root.optJSONObject("shunt")
+            val indoor = root.optJSONObject("indoor")
             return Telemetry(
                 sensors = sensors,
                 wifiConnected = wifi?.optBoolean("c", false) ?: false,
-                wifiSsid = wifi?.optString("ssid").orEmpty(),
+                wifiSsid = root.optString("ssid"),
                 wifiRssi = if (wifi?.has("rssi") == true) wifi.getInt("rssi") else null,
                 wifiDisconnects = if (wifi?.has("disc") == true) wifi.getLong("disc") else null,
                 lastWifiDisconnect = if (wifi?.has("reason") == true) {
@@ -284,7 +445,7 @@ data class Telemetry(
                     null
                 },
                 mqttConnected = mqtt?.optBoolean("c", false) ?: false,
-                mqttUrl = mqtt?.optString("url").orEmpty(),
+                mqttUrl = root.optString("url"),
                 heaterOn = root.optBoolean("heater", false),
                 heaterOnThresholdC = root.optDouble("onC", Double.NaN),
                 heaterOffThresholdC = root.optDouble("offC", Double.NaN),
@@ -296,6 +457,39 @@ data class Telemetry(
                         percent = if (it.has("pct")) it.getInt("pct") else null,
                         version = it.optString("ver").takeIf { v -> v.isNotEmpty() },
                         error = it.optString("err").takeIf { e -> e.isNotEmpty() },
+                    )
+                },
+                // The live state and the settings arrive in different
+                // documents; both are needed to describe the controller.
+                shunt = shunt?.let {
+                    ShuntStatus(
+                        enabled = it.optBoolean("en", false),
+                        state = it.optString("state", "off"),
+                        direction = ShuntDirection.fromWire(it.optString("dir")),
+                        reason = it.optString("why").takeIf { w -> w.isNotEmpty() },
+                        setpointC = if (it.has("sp")) it.getDouble("sp") else null,
+                        supplyC = if (it.has("sup")) it.getDouble("sup") else null,
+                        outdoorC = if (it.has("out")) it.getDouble("out") else null,
+                        position = it.optDouble("pos", 0.0),
+                        slope = curve?.optDouble("slope", 1.0) ?: 1.0,
+                        offsetC = curve?.optDouble("offset", 0.0) ?: 0.0,
+                        targetC = curve?.optDouble("target", 21.0) ?: 21.0,
+                        minSupplyC = curve?.optDouble("min", 20.0) ?: 20.0,
+                        maxSupplyC = curve?.optDouble("max", 70.0) ?: 70.0,
+                        travelS = curve?.optInt("travel", 120) ?: 120,
+                        authorityC = curve?.optDouble("authority", 50.0) ?: 50.0,
+                    )
+                },
+                indoor = indoor?.let {
+                    IndoorStatus(
+                        topic = it.optString("topic"),
+                        celsius = if (shunt?.has("in") == true) shunt.getDouble("in") else null,
+                        ageMs = if (shunt?.has("inAge") == true) shunt.getLong("inAge") else null,
+                        fresh = shunt?.optBoolean("inFresh", false) ?: false,
+                        trimC = shunt?.optDouble("trim", 0.0) ?: 0.0,
+                        gain = it.optDouble("gain", 0.0),
+                        maxTrimC = it.optDouble("maxTrim", 0.0),
+                        staleS = it.optInt("stale", 900),
                     )
                 },
             )

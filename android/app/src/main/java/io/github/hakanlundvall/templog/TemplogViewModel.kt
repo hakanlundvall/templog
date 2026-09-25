@@ -6,6 +6,8 @@ import androidx.lifecycle.viewModelScope
 import io.github.hakanlundvall.templog.ble.CommandException
 import io.github.hakanlundvall.templog.ble.ConnectionState
 import io.github.hakanlundvall.templog.ble.Protocol
+import io.github.hakanlundvall.templog.ble.SensorRole
+import io.github.hakanlundvall.templog.ble.ShuntDirection
 import io.github.hakanlundvall.templog.ble.TemplogBleClient
 import io.github.hakanlundvall.templog.update.FirmwareRelease
 import io.github.hakanlundvall.templog.update.FirmwareReleases
@@ -76,8 +78,35 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
 
     fun setMqtt(url: String) = issue("MQTT broker set to $url", Protocol.setMqtt(url))
 
-    fun setWaterSensor(romCodeHex: String) =
-        issue("Water sensor set to $romCodeHex", Protocol.setWaterSensor(romCodeHex))
+    fun setSensorRole(romCodeHex: String, role: SensorRole) = issue(
+        if (role == SensorRole.NONE) {
+            "$romCodeHex no longer has a role"
+        } else {
+            "$romCodeHex is now the ${role.label} sensor"
+        },
+        Protocol.setSensorRole(romCodeHex, role),
+    )
+
+    fun setCurve(slope: Double, offsetC: Double, targetC: Double, minC: Double, maxC: Double) =
+        issue("Heating curve updated", Protocol.setCurve(slope, offsetC, targetC, minC, maxC))
+
+    fun setActuator(travelS: Int, authorityC: Double) =
+        issue("Actuator settings updated", Protocol.setActuator(travelS, authorityC))
+
+    fun setShuntEnabled(enabled: Boolean) = issue(
+        if (enabled) "Shunt control started" else "Shunt control stopped",
+        Protocol.setShuntEnabled(enabled),
+    )
+
+    fun setIndoor(topic: String, gain: Double, maxTrimC: Double, staleS: Int) = issue(
+        if (topic.isBlank()) "Indoor trim switched off" else "Indoor temperature read from $topic",
+        Protocol.setIndoor(topic, gain, maxTrimC, staleS),
+    )
+
+    fun jogShunt(dir: ShuntDirection, seconds: Int) = issue(
+        "Running the actuator ${dir.wire} for ${seconds}s",
+        Protocol.shuntJog(dir, seconds * 1000),
+    )
 
     fun setThresholds(onC: Double, offC: Double) =
         issue("Thresholds set to on $onC °C / off $offC °C", Protocol.setThresholds(onC, offC))

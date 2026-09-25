@@ -87,6 +87,9 @@ class TemplogBleClient(context: Context) {
     private val _telemetry = MutableStateFlow<Telemetry?>(null)
     val telemetry: StateFlow<Telemetry?> = _telemetry.asStateFlow()
 
+    /** The newest copy of each reported document, keyed by characteristic. */
+    private val documents = linkedMapOf<UUID, JSONObject>()
+
     private val _deviceAddress = MutableStateFlow<String?>(null)
     val deviceAddress: StateFlow<String?> = _deviceAddress.asStateFlow()
 
@@ -257,11 +260,11 @@ class TemplogBleClient(context: Context) {
         }
     }
 
-    /** Re-reads the telemetry characteristic without waiting for a notification. */
+    /** Re-reads everything the device publishes, without waiting for a notification. */
     fun refreshTelemetry() {
         handler.post {
             if (_connectionState.value == ConnectionState.READY) {
-                enqueue(Op.Read(Protocol.TELEMETRY_CHAR_UUID))
+                for (uuid in REPORT_CHARS) enqueue(Op.Read(uuid))
             }
         }
     }
@@ -339,6 +342,10 @@ class TemplogBleClient(context: Context) {
         queue.clear()
         pending = null
         awaitingBond.clear()
+        // Documents from the old connection would otherwise be merged with
+        // the new one's, which matters if the device was reconfigured or
+        // reflashed while it was away.
+        documents.clear()
         gatt?.let {
             runCatching { it.disconnect() }
             runCatching { it.close() }
@@ -575,9 +582,11 @@ class TemplogBleClient(context: Context) {
                 }
                 // Subscribing touches an encrypted characteristic, which is
                 // what triggers pairing on a fresh device.
-                enqueue(Op.Subscribe(Protocol.TELEMETRY_CHAR_UUID))
+                for (uuid in REPORT_CHARS) enqueue(Op.Subscribe(uuid))
                 enqueue(Op.Subscribe(Protocol.STATUS_CHAR_UUID))
-                enqueue(Op.Read(Protocol.TELEMETRY_CHAR_UUID))
+                // The settings characteristic only notifies when it changes,
+                // so it has to be read once here or it would stay unknown.
+                for (uuid in REPORT_CHARS) enqueue(Op.Read(uuid))
             }
         }
 
@@ -672,14 +681,14 @@ class TemplogBleClient(context: Context) {
             }
             val json = value.toString(Charsets.UTF_8)
             when (uuid) {
-                Protocol.TELEMETRY_CHAR_UUID -> {
-                    runCatching { Telemetry.parse(json) }
+                in REPORT_CHARS -> {
+                    runCatching { mergeDocument(uuid, json) }
                         .onSuccess {
                             _telemetry.value = it
                             backoffMs = MIN_BACKOFF_MS
                             _connectionState.value = ConnectionState.READY
                         }
-                        .onFailure { Log.w(TAG, "bad telemetry JSON: $json", it) }
+                        .onFailure { Log.w(TAG, "bad telemetry JSON from $uuid: $json", it) }
                 }
 
                 Protocol.STATUS_CHAR_UUID -> {
@@ -693,6 +702,23 @@ class TemplogBleClient(context: Context) {
     }
 
     /**
+     * Keeps the newest copy of each of the three documents and parses them as
+     * one. Merging rather than parsing each on its own means a notification on
+     * one characteristic does not discard what the others last said; the
+     * documents share no keys, so the order they are merged in does not
+     * matter. Throws if the result does not parse, which is handled by the
+     * caller.
+     */
+    private fun mergeDocument(uuid: UUID, json: String): Telemetry {
+        documents[uuid] = JSONObject(json)
+        val merged = JSONObject()
+        for (document in documents.values) {
+            for (key in document.keys()) merged.put(key, document.get(key))
+        }
+        return Telemetry.parse(merged.toString())
+    }
+
+    /**
      * A notification only carries a one byte placeholder, so the real value has
      * to be fetched with a read; the read is not truncated by the ATT MTU.
      */
@@ -700,7 +726,7 @@ class TemplogBleClient(context: Context) {
         handler.post {
             if (g !== gatt) return@post
             when (uuid) {
-                Protocol.TELEMETRY_CHAR_UUID -> enqueue(Op.Read(Protocol.TELEMETRY_CHAR_UUID))
+                in REPORT_CHARS -> enqueue(Op.Read(uuid))
                 Protocol.STATUS_CHAR_UUID -> enqueue(Op.Read(Protocol.STATUS_CHAR_UUID))
             }
         }
@@ -788,6 +814,16 @@ class TemplogBleClient(context: Context) {
         }
 
     companion object {
+        /**
+         * The characteristics the device reports through. They are read and
+         * merged into one [Telemetry]; see [Protocol] for why there are three.
+         */
+        private val REPORT_CHARS = listOf(
+            Protocol.TELEMETRY_CHAR_UUID,
+            Protocol.SENSORS_CHAR_UUID,
+            Protocol.CONFIG_CHAR_UUID,
+        )
+
         private const val TAG = "TemplogBle"
 
         private const val MIN_BACKOFF_MS = 1_000L

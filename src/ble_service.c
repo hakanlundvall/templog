@@ -1,5 +1,6 @@
 #include "ble_service.h"
 
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -36,11 +37,23 @@ static const ble_uuid128_t CHR_STATUS_UUID =
 static const ble_uuid128_t CHR_FIRMWARE_UUID =
     BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
                       0x93, 0xf3, 0xa3, 0xb5, 0x04, 0x00, 0x40, 0x6e);
+static const ble_uuid128_t CHR_SENSORS_UUID =
+    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                      0x93, 0xf3, 0xa3, 0xb5, 0x05, 0x00, 0x40, 0x6e);
+static const ble_uuid128_t CHR_CONFIG_UUID =
+    BLE_UUID128_INIT(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                      0x93, 0xf3, 0xa3, 0xb5, 0x06, 0x00, 0x40, 0x6e);
 
-/* Sized separately: telemetry is by far the largest document, while an
- * incoming command is at most a Wi-Fi or broker URL payload. Keeping the
- * command buffer small matters because it lives on the NimBLE host stack. */
-#define MAX_TELEMETRY_JSON_LEN 1280
+/* What the device reports is split across three characteristics because a
+ * GATT client will not read more than 512 bytes of one attribute value:
+ * Android's stack truncates there, silently. Sensors are the part that grows,
+ * at around 58 bytes each, so eight of them get a characteristic to
+ * themselves; the live state and the settings each stay comfortably inside
+ * one read. The command buffer is small on purpose: it lives on the NimBLE
+ * host task's stack. */
+#define MAX_SENSORS_JSON_LEN 512
+#define MAX_TELEMETRY_JSON_LEN 512
+#define MAX_CONFIG_JSON_LEN 512
 #define MAX_STATUS_JSON_LEN 256
 #define MAX_CMD_JSON_LEN 512
 /* One firmware chunk: a 4 byte offset plus as much as an ATT write can carry
@@ -54,12 +67,20 @@ static SemaphoreHandle_t s_state_mutex;
 
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_telemetry_val_handle;
+static uint16_t s_sensors_val_handle;
+static uint16_t s_config_val_handle;
 static uint16_t s_status_val_handle;
 static bool s_telemetry_subscribed;
+static bool s_sensors_subscribed;
+static bool s_config_subscribed;
 static bool s_status_subscribed;
 
 static char s_telemetry_json[MAX_TELEMETRY_JSON_LEN];
 static size_t s_telemetry_json_len;
+static char s_sensors_json[MAX_SENSORS_JSON_LEN];
+static size_t s_sensors_json_len;
+static char s_config_json[MAX_CONFIG_JSON_LEN];
+static size_t s_config_json_len;
 static char s_status_json[MAX_STATUS_JSON_LEN];
 static size_t s_status_json_len;
 
@@ -83,6 +104,22 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .uuid = &CHR_COMMAND_UUID.u,
                 .access_cb = gatt_svr_chr_access,
                 .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
+            },
+            {
+                /* The readings, which are what grows with the number of
+                 * sensors, hence their own characteristic. */
+                .uuid = &CHR_SENSORS_UUID.u,
+                .access_cb = gatt_svr_chr_access,
+                .val_handle = &s_sensors_val_handle,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
+            },
+            {
+                /* Settings, which only change when a command changes them, so
+                 * this one rarely notifies. */
+                .uuid = &CHR_CONFIG_UUID.u,
+                .access_cb = gatt_svr_chr_access,
+                .val_handle = &s_config_val_handle,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
             },
             {
                 .uuid = &CHR_STATUS_UUID.u,
@@ -123,6 +160,23 @@ static int read_flat_value(struct ble_gatt_access_ctxt *ctxt, const char *buf, s
 {
     int rc = os_mbuf_append(ctxt->om, buf, len);
     return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+/* A number that may be left out, in a command where every field is optional.
+ * NAN and 0 are the "leave unchanged" markers the firmware looks for. */
+static float opt_float(const cJSON *root, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    return cJSON_IsNumber(item) ? (float)item->valuedouble : NAN;
+}
+
+static uint16_t opt_u16(const cJSON *root, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsNumber(item) || item->valuedouble < 1 || item->valuedouble > UINT16_MAX) {
+        return 0;
+    }
+    return (uint16_t)item->valuedouble;
 }
 
 static void handle_command_json(const char *json, size_t len)
@@ -168,15 +222,66 @@ static void handle_command_json(const char *json, size_t len)
             out.type = BLE_CMD_SET_MQTT;
             strlcpy(out.data.mqtt.url, url->valuestring, sizeof(out.data.mqtt.url));
         }
-    } else if (strcmp(cmd, "set_water_sensor") == 0) {
+    } else if (strcmp(cmd, "set_sensor_role") == 0 || strcmp(cmd, "set_water_sensor") == 0) {
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
+        const cJSON *role = cJSON_GetObjectItemCaseSensitive(root, "role");
+        /* set_water_sensor is what the first version of the protocol called
+         * this, and older clients still send it. */
+        const char *role_s = cJSON_IsString(role) ? role->valuestring : "water";
         if (!cJSON_IsString(id)) {
             ok = false;
             error = "id required";
+        } else if (strlen(role_s) >= sizeof(out.data.sensor_role.role)) {
+            ok = false;
+            error = "unknown role";
         } else {
-            out.type = BLE_CMD_SET_WATER_SENSOR;
-            strlcpy(out.data.water_sensor.rom_code_hex, id->valuestring,
-                    sizeof(out.data.water_sensor.rom_code_hex));
+            out.type = BLE_CMD_SET_SENSOR_ROLE;
+            strlcpy(out.data.sensor_role.cmd, cmd, sizeof(out.data.sensor_role.cmd));
+            strlcpy(out.data.sensor_role.role, role_s, sizeof(out.data.sensor_role.role));
+            strlcpy(out.data.sensor_role.rom_code_hex, id->valuestring,
+                    sizeof(out.data.sensor_role.rom_code_hex));
+        }
+    } else if (strcmp(cmd, "set_shunt") == 0) {
+        const cJSON *enabled = cJSON_GetObjectItemCaseSensitive(root, "enabled");
+        const cJSON *topic = cJSON_GetObjectItemCaseSensitive(root, "indoorTopic");
+        if (topic != NULL && !cJSON_IsString(topic)) {
+            ok = false;
+            error = "indoorTopic must be a string";
+        } else if (cJSON_IsString(topic) && strlen(topic->valuestring) >= BLE_MQTT_TOPIC_LEN) {
+            ok = false;
+            error = "indoorTopic too long";
+        } else {
+            out.type = BLE_CMD_SET_SHUNT;
+            out.data.shunt.enabled = cJSON_IsBool(enabled) ? (cJSON_IsTrue(enabled) ? 1 : 0) : -1;
+            out.data.shunt.slope = opt_float(root, "slope");
+            out.data.shunt.offset_c = opt_float(root, "offset");
+            out.data.shunt.room_target_c = opt_float(root, "target");
+            out.data.shunt.min_supply_c = opt_float(root, "min");
+            out.data.shunt.max_supply_c = opt_float(root, "max");
+            out.data.shunt.authority_c = opt_float(root, "authority");
+            out.data.shunt.indoor_gain = opt_float(root, "indoorGain");
+            out.data.shunt.indoor_max_c = opt_float(root, "indoorMax");
+            out.data.shunt.travel_s = opt_u16(root, "travel");
+            out.data.shunt.indoor_stale_s = opt_u16(root, "indoorStale");
+            if (cJSON_IsString(topic)) {
+                out.data.shunt.set_indoor_topic = true;
+                strlcpy(out.data.shunt.indoor_topic, topic->valuestring,
+                        sizeof(out.data.shunt.indoor_topic));
+            }
+        }
+    } else if (strcmp(cmd, "shunt_jog") == 0) {
+        const cJSON *dir = cJSON_GetObjectItemCaseSensitive(root, "dir");
+        const cJSON *ms = cJSON_GetObjectItemCaseSensitive(root, "ms");
+        if (!cJSON_IsString(dir) || strlen(dir->valuestring) >= sizeof(out.data.jog.dir)) {
+            ok = false;
+            error = "dir must be warmer or colder";
+        } else if (!cJSON_IsNumber(ms) || ms->valuedouble < 1 || ms->valuedouble > (double)UINT32_MAX) {
+            ok = false;
+            error = "ms required";
+        } else {
+            out.type = BLE_CMD_SHUNT_JOG;
+            strlcpy(out.data.jog.dir, dir->valuestring, sizeof(out.data.jog.dir));
+            out.data.jog.ms = (uint32_t)ms->valuedouble;
         }
     } else if (strcmp(cmd, "set_thresholds") == 0) {
         const cJSON *on = cJSON_GetObjectItemCaseSensitive(root, "on");
@@ -272,6 +377,22 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
         int rc = read_flat_value(ctxt, s_telemetry_json, s_telemetry_json_len);
         xSemaphoreGive(s_state_mutex);
         return rc;
+    } else if (ble_uuid_cmp(ctxt->chr->uuid, &CHR_SENSORS_UUID.u) == 0) {
+        if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        int rc = read_flat_value(ctxt, s_sensors_json, s_sensors_json_len);
+        xSemaphoreGive(s_state_mutex);
+        return rc;
+    } else if (ble_uuid_cmp(ctxt->chr->uuid, &CHR_CONFIG_UUID.u) == 0) {
+        if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        int rc = read_flat_value(ctxt, s_config_json, s_config_json_len);
+        xSemaphoreGive(s_state_mutex);
+        return rc;
     } else if (ble_uuid_cmp(ctxt->chr->uuid, &CHR_STATUS_UUID.u) == 0) {
         if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
             return BLE_ATT_ERR_UNLIKELY;
@@ -345,6 +466,8 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_telemetry_subscribed = false;
+        s_sensors_subscribed = false;
+        s_config_subscribed = false;
         s_status_subscribed = false;
         start_advertising();
         return 0;
@@ -355,6 +478,10 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_SUBSCRIBE:
         if (event->subscribe.attr_handle == s_telemetry_val_handle) {
             s_telemetry_subscribed = event->subscribe.cur_notify;
+        } else if (event->subscribe.attr_handle == s_sensors_val_handle) {
+            s_sensors_subscribed = event->subscribe.cur_notify;
+        } else if (event->subscribe.attr_handle == s_config_val_handle) {
+            s_config_subscribed = event->subscribe.cur_notify;
         } else if (event->subscribe.attr_handle == s_status_val_handle) {
             s_status_subscribed = event->subscribe.cur_notify;
         }
@@ -443,6 +570,10 @@ void ble_service_init(QueueHandle_t command_queue, ble_firmware_chunk_cb on_firm
     s_state_mutex = xSemaphoreCreateMutex();
     snprintf(s_telemetry_json, sizeof(s_telemetry_json), "{}");
     s_telemetry_json_len = strlen(s_telemetry_json);
+    snprintf(s_sensors_json, sizeof(s_sensors_json), "{}");
+    s_sensors_json_len = strlen(s_sensors_json);
+    snprintf(s_config_json, sizeof(s_config_json), "{}");
+    s_config_json_len = strlen(s_config_json);
     snprintf(s_status_json, sizeof(s_status_json), "{}");
     s_status_json_len = strlen(s_status_json);
 
@@ -479,24 +610,77 @@ void ble_service_init(QueueHandle_t command_queue, ble_firmware_chunk_cb on_firm
     nimble_port_freertos_init(host_task);
 }
 
+/* cJSON prints a number with as many digits as it takes to read it back
+ * exactly, and a float widened to a double needs seventeen of them: 62.3f
+ * would go out as "62.299999237060547". Rounding in double arithmetic first
+ * gives back the short form, which is what keeps these documents inside one
+ * GATT read. */
+static void add_rounded(cJSON *object, const char *key, float value, int decimals)
+{
+    double scale = decimals == 1 ? 10.0 : 100.0;
+    cJSON_AddNumberToObject(object, key, round((double)value * scale) / scale);
+}
+
+/* Renders `root` and, if the result differs from what the characteristic
+ * already holds, stores it and notifies. Returns nothing: a document too
+ * large to fit is dropped with a warning rather than sent truncated, since a
+ * half document would fail to parse on the client anyway. */
+static void publish_document(cJSON *root, char *buffer, size_t buffer_len,
+                              size_t *stored_len, uint16_t val_handle, bool subscribed,
+                              bool notify_only_on_change, const char *what)
+{
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (out == NULL) {
+        return;
+    }
+
+    size_t len = strlen(out);
+    if (len >= buffer_len) {
+        ESP_LOGW(TAG, "%s document is %u bytes, too large to publish", what, (unsigned)len);
+        cJSON_free(out);
+        return;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool changed = strcmp(buffer, out) != 0;
+    if (changed) {
+        memcpy(buffer, out, len + 1);
+        *stored_len = len;
+    }
+    xSemaphoreGive(s_state_mutex);
+    cJSON_free(out);
+
+    if (changed || !notify_only_on_change) {
+        send_notification(val_handle, subscribed);
+    }
+}
+
 void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
 {
-    cJSON *root = cJSON_CreateObject();
-    cJSON *temps = cJSON_AddArrayToObject(root, "t");
+    /* The readings, which are what grows with the number of sensors. */
+    cJSON *sensors = cJSON_CreateObject();
+    cJSON *temps = cJSON_AddArrayToObject(sensors, "t");
     for (int i = 0; i < telemetry->num_readings; ++i) {
         const ble_temp_reading_t *r = &telemetry->readings[i];
         cJSON *item = cJSON_CreateObject();
         cJSON_AddStringToObject(item, "id", r->rom_code_hex);
         if (r->valid) {
-            cJSON_AddNumberToObject(item, "c", r->value_c);
+            add_rounded(item, "c", r->value_c, 1);
             cJSON_AddNumberToObject(item, "age", r->age_ms);
         }
-        cJSON_AddBoolToObject(item, "water", r->is_water_sensor);
+        if (r->role != NULL) {
+            cJSON_AddStringToObject(item, "role", r->role);
+        }
         cJSON_AddItemToArray(temps, item);
     }
+    publish_document(sensors, s_sensors_json, sizeof(s_sensors_json), &s_sensors_json_len,
+                     s_sensors_val_handle, s_sensors_subscribed, false, "sensors");
+
+    /* Live state: everything that moves on its own. */
+    cJSON *root = cJSON_CreateObject();
     cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
     cJSON_AddBoolToObject(wifi, "c", telemetry->wifi_connected);
-    cJSON_AddStringToObject(wifi, "ssid", telemetry->wifi_ssid);
     if (telemetry->wifi_rssi_valid) {
         cJSON_AddNumberToObject(wifi, "rssi", telemetry->wifi_rssi);
     }
@@ -508,12 +692,38 @@ void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
     }
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
     cJSON_AddBoolToObject(mqtt, "c", telemetry->mqtt_connected);
-    cJSON_AddStringToObject(mqtt, "url", telemetry->mqtt_url);
     cJSON_AddBoolToObject(root, "heater", telemetry->heater_on);
-    cJSON_AddNumberToObject(root, "onC", telemetry->heater_on_threshold_c);
-    cJSON_AddNumberToObject(root, "offC", telemetry->heater_off_threshold_c);
     cJSON_AddNumberToObject(root, "forceState", telemetry->heater_force_state);
-    cJSON_AddStringToObject(root, "fw", telemetry->fw_version);
+
+    cJSON *shunt = cJSON_AddObjectToObject(root, "shunt");
+    cJSON_AddBoolToObject(shunt, "en", telemetry->shunt_enabled);
+    cJSON_AddStringToObject(shunt, "state", telemetry->shunt_state ? telemetry->shunt_state : "off");
+    cJSON_AddStringToObject(shunt, "dir", telemetry->shunt_dir ? telemetry->shunt_dir : "idle");
+    if (telemetry->shunt_reason != NULL) {
+        cJSON_AddStringToObject(shunt, "why", telemetry->shunt_reason);
+    }
+    /* A reading that has never arrived is left out rather than sent as null,
+     * so a client can tell "not known" from "zero degrees". */
+    if (!isnan(telemetry->shunt_setpoint_c)) {
+        add_rounded(shunt, "sp", telemetry->shunt_setpoint_c, 1);
+    }
+    if (!isnan(telemetry->shunt_supply_c)) {
+        add_rounded(shunt, "sup", telemetry->shunt_supply_c, 1);
+    }
+    if (!isnan(telemetry->shunt_outdoor_c)) {
+        add_rounded(shunt, "out", telemetry->shunt_outdoor_c, 1);
+    }
+    add_rounded(shunt, "pos", telemetry->shunt_position, 2);
+    /* The indoor reading lives here rather than in an object of its own: the
+     * clients merge the three documents, and the settings document already
+     * has an "indoor" object. */
+    if (!isnan(telemetry->indoor_c)) {
+        add_rounded(shunt, "in", telemetry->indoor_c, 1);
+        cJSON_AddNumberToObject(shunt, "inAge", telemetry->indoor_age_ms);
+    }
+    cJSON_AddBoolToObject(shunt, "inFresh", telemetry->indoor_fresh);
+    add_rounded(shunt, "trim", telemetry->indoor_trim_c, 1);
+
     cJSON *ota = cJSON_AddObjectToObject(root, "ota");
     cJSON_AddStringToObject(ota, "state", telemetry->ota_state ? telemetry->ota_state : "idle");
     if (telemetry->ota_percent >= 0) {
@@ -525,18 +735,32 @@ void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
     if (telemetry->ota_error != NULL) {
         cJSON_AddStringToObject(ota, "err", telemetry->ota_error);
     }
+    publish_document(root, s_telemetry_json, sizeof(s_telemetry_json), &s_telemetry_json_len,
+                     s_telemetry_val_handle, s_telemetry_subscribed, false, "telemetry");
 
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    char *out = cJSON_PrintUnformatted(root);
-    if (out != NULL) {
-        strlcpy(s_telemetry_json, out, sizeof(s_telemetry_json));
-        s_telemetry_json_len = strlen(s_telemetry_json);
-        cJSON_free(out);
-    }
-    xSemaphoreGive(s_state_mutex);
-    cJSON_Delete(root);
-
-    send_notification(s_telemetry_val_handle, s_telemetry_subscribed);
+    /* Settings, which only move when a command moves them: this one is
+     * notified only when it actually changed. */
+    cJSON *config = cJSON_CreateObject();
+    cJSON_AddStringToObject(config, "ssid", telemetry->wifi_ssid);
+    cJSON_AddStringToObject(config, "url", telemetry->mqtt_url);
+    add_rounded(config, "onC", telemetry->heater_on_threshold_c, 1);
+    add_rounded(config, "offC", telemetry->heater_off_threshold_c, 1);
+    cJSON *curve = cJSON_AddObjectToObject(config, "curve");
+    add_rounded(curve, "slope", telemetry->curve_slope, 2);
+    add_rounded(curve, "offset", telemetry->curve_offset_c, 1);
+    add_rounded(curve, "target", telemetry->curve_target_c, 1);
+    add_rounded(curve, "min", telemetry->curve_min_supply_c, 1);
+    add_rounded(curve, "max", telemetry->curve_max_supply_c, 1);
+    cJSON_AddNumberToObject(curve, "travel", telemetry->actuator_travel_s);
+    add_rounded(curve, "authority", telemetry->actuator_authority_c, 1);
+    cJSON *indoor_cfg = cJSON_AddObjectToObject(config, "indoor");
+    cJSON_AddStringToObject(indoor_cfg, "topic", telemetry->indoor_topic);
+    add_rounded(indoor_cfg, "gain", telemetry->indoor_gain, 2);
+    add_rounded(indoor_cfg, "maxTrim", telemetry->indoor_max_c, 1);
+    cJSON_AddNumberToObject(indoor_cfg, "stale", telemetry->indoor_stale_s);
+    cJSON_AddStringToObject(config, "fw", telemetry->fw_version);
+    publish_document(config, s_config_json, sizeof(s_config_json), &s_config_json_len,
+                     s_config_val_handle, s_config_subscribed, true, "config");
 }
 
 void ble_service_report_status(const char *cmd, bool ok, const char *error)

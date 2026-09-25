@@ -13,6 +13,7 @@ extern "C" {
 #define BLE_MAX_TEMP_SENSORS 8
 #define BLE_ROM_CODE_HEX_LEN 16 /* 8 bytes -> 16 hex chars, plus NUL */
 #define BLE_MQTT_URL_LEN 100    /* matches the broker URL buffer in main.c */
+#define BLE_MQTT_TOPIC_LEN 80   /* topic the indoor temperature is published on */
 #define BLE_FW_VERSION_LEN 32   /* esp_app_desc_t.version, including the terminator */
 #define BLE_OTA_TAG_LEN 32      /* matches OTA_TAG_MAX_LEN in ota.h */
 
@@ -22,7 +23,8 @@ typedef struct {
     float value_c;
     uint32_t age_ms; /* time since the last good reading of this sensor */
     bool valid;      /* false if this sensor has never produced a good reading */
-    bool is_water_sensor;
+    /* "water", "outdoor" or "supply"; NULL when this sensor has no role. */
+    const char *role;
 } ble_temp_reading_t;
 
 /* Full telemetry snapshot pushed from the application into the BLE layer. */
@@ -44,6 +46,32 @@ typedef struct {
     float heater_off_threshold_c;
     /* 0 = automatic, 1 = forced off until conditions met again, 2 = forced off until explicitly started */
     int heater_force_state;
+    /* Shunt valve control: the curve settings, the actuator, and where the
+     * loop currently stands. */
+    bool shunt_enabled;
+    const char *shunt_state;  /* "off", "running", "holding" or "manual" */
+    const char *shunt_dir;    /* "idle", "warmer" or "colder" */
+    const char *shunt_reason; /* why it is holding; NULL while running */
+    float shunt_setpoint_c;   /* NAN while it cannot be computed */
+    float shunt_supply_c;     /* NAN when the supply sensor has never been read */
+    float shunt_outdoor_c;    /* NAN when the outdoor sensor has never been read */
+    float shunt_position;     /* 0 = fully cold, 1 = fully warm; an estimate */
+    float curve_slope;
+    float curve_offset_c;
+    float curve_target_c;
+    float curve_min_supply_c;
+    float curve_max_supply_c;
+    uint16_t actuator_travel_s;
+    float actuator_authority_c;
+    /* Indoor temperature, which arrives over MQTT rather than from a sensor. */
+    char indoor_topic[BLE_MQTT_TOPIC_LEN];
+    float indoor_c;          /* NAN when nothing has been received */
+    uint32_t indoor_age_ms;  /* UINT32_MAX when nothing has been received */
+    bool indoor_fresh;       /* false when the trim is being ignored */
+    float indoor_trim_c;
+    float indoor_gain;
+    float indoor_max_c;
+    uint16_t indoor_stale_s;
     char fw_version[BLE_FW_VERSION_LEN];
     /* OTA progress: state name from ota_state_name(), percent (-1 if unknown),
      * the version being installed ("" if not known) and an error or NULL. */
@@ -56,7 +84,7 @@ typedef struct {
 typedef enum {
     BLE_CMD_SET_WIFI,
     BLE_CMD_SET_MQTT,
-    BLE_CMD_SET_WATER_SENSOR,
+    BLE_CMD_SET_SENSOR_ROLE,
     BLE_CMD_SET_THRESHOLDS,
     BLE_CMD_HEATER_FORCE_OFF,
     BLE_CMD_HEATER_ON,
@@ -64,6 +92,8 @@ typedef enum {
     BLE_CMD_OTA_BLE_BEGIN,
     BLE_CMD_OTA_BLE_END,
     BLE_CMD_OTA_BLE_ABORT,
+    BLE_CMD_SET_SHUNT,
+    BLE_CMD_SHUNT_JOG,
 } ble_cmd_type_t;
 
 typedef enum {
@@ -83,8 +113,35 @@ typedef struct {
             char url[BLE_MQTT_URL_LEN];
         } mqtt;
         struct {
+            /* "water", "outdoor" or "supply"; "none" clears the role. */
+            char role[16];
             char rom_code_hex[BLE_ROM_CODE_HEX_LEN + 1];
-        } water_sensor;
+            /* The name the client used, so the status reply it is waiting for
+             * comes back under that name and not under the canonical one. */
+            char cmd[20];
+        } sensor_role;
+        /* Every field is optional: a NAN float, a zero integer or a false
+         * set_* flag means "leave that setting as it is", so one setting can
+         * be changed without the sender restating the rest. */
+        struct {
+            int8_t enabled; /* -1 unchanged, 0 off, 1 on */
+            float slope;
+            float offset_c;
+            float room_target_c;
+            float min_supply_c;
+            float max_supply_c;
+            uint16_t travel_s;
+            float authority_c;
+            float indoor_gain;
+            float indoor_max_c;
+            uint16_t indoor_stale_s;
+            bool set_indoor_topic;
+            char indoor_topic[BLE_MQTT_TOPIC_LEN];
+        } shunt;
+        struct {
+            char dir[8]; /* "warmer" or "colder" */
+            uint32_t ms;
+        } jog;
         struct {
             float on_c;
             float off_c;
@@ -118,7 +175,11 @@ typedef bool (*ble_firmware_chunk_cb)(uint32_t offset, const uint8_t *data, size
  * on_firmware_chunk may be NULL if the application accepts no image over BLE. */
 void ble_service_init(QueueHandle_t command_queue, ble_firmware_chunk_cb on_firmware_chunk);
 
-/* Publishes a new telemetry snapshot and notifies any subscribed client. */
+/* Publishes a new snapshot. It is split across three characteristics, because
+ * a GATT client will not read more than 512 bytes of one attribute value and
+ * Android's stack truncates silently at that point: the sensor readings (the
+ * part that grows), the live state, and the settings. Subscribers are notified
+ * of the first two on every update and of the settings only when they change. */
 void ble_service_update_telemetry(const ble_telemetry_t *telemetry);
 
 /* Reports the outcome of the most recently processed command so the

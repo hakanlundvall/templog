@@ -14,14 +14,23 @@ Bluetooth Low Energy, shows live telemetry, and sends the same set of commands.
   read triggers the firmware's "Just Works" LE Secure Connections pairing.
   Android shows its normal pairing prompt; after that the bond is remembered by
   both sides.
-* **Shows status.** Every temperature sensor with its ROM code, value and
-  reading age, which one is the water sensor, Wi-Fi connection state and SSID,
+* **Shows status.** Every temperature sensor with its ROM code, value,
+  reading age and the role it has been given, Wi-Fi connection state and SSID,
   the MQTT broker URL and whether it is connected, heater on/off, the on/off
-  thresholds and the current force-off mode.
+  thresholds and the current force-off mode, and what the shunt valve control
+  is doing: the supply temperature it is aiming for, the one it measures, how
+  far the valve is thought to be open, and whether the indoor reading is fresh
+  enough to be trimming the curve.
 * **Controls the device.** Start the heater, force it off (either until the
   start conditions are met again or until explicitly started), change the
-  thresholds, choose the water sensor, set the Wi-Fi credentials, and point
+  thresholds, say what each sensor is for, set the Wi-Fi credentials, and point
   the device at a different MQTT broker.
+* **Adjusts the heating curve.** The slope and parallel offset that turn the
+  outdoor temperature into a supply temperature, the indoor target the curve
+  pivots about, and the supply limits — the same dials as the panel this
+  replaces, with a preview of what the curve asks for at +5 and −15 °C. The
+  actuator's travel time and authority are set here too, and the valve can be
+  run by hand in either direction to check the wiring and time its travel.
 * **Survives a bad link.** Disconnects re-enter the connect loop with
   exponential backoff (1s doubling to 30s), matching the Pi service.
 
@@ -34,11 +43,17 @@ apply immediately and persist on the device.
 
 ## Protocol notes
 
-The firmware sends a fixed one byte payload for *both* notify
-characteristics — a notification only means "something changed", because a
+The firmware sends a fixed one byte payload for *every* notify
+characteristic — a notification only means "something changed", because a
 notification can never exceed the negotiated ATT MTU. The app therefore always
 follows a notification with a read of the characteristic, for status replies
-just as much as for telemetry. `Protocol.kt` mirrors
+just as much as for telemetry.
+
+What the device reports arrives on three characteristics — live state, sensor
+readings and settings — which the client reads and merges into one
+`Telemetry`. They are separate because Android's GATT stack truncates a
+characteristic read at 512 bytes without reporting it, and the sensor array
+alone approaches that with a full bus. `Protocol.kt` mirrors
 [`../rpi/templog_ble/protocol.py`](../rpi/templog_ble/protocol.py).
 
 ## Layout

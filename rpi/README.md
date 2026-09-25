@@ -6,12 +6,17 @@ over Bluetooth Low Energy (BLE), robust against flaky BLE connectivity.
 ## How it works
 
 * The ESP32 advertises as `templog` and exposes a custom GATT service with:
-  * a **telemetry** characteristic (read + notify) — temperatures (with age),
-    Wi-Fi connection state + SSID, MQTT broker URL + connection state,
-    heater on/off,
+  * a **telemetry** characteristic (read + notify) — live state: Wi-Fi and
+    MQTT connection, heater on/off and mode, what the shunt valve control is
+    doing, OTA progress,
+  * a **sensors** characteristic (read + notify) — the temperatures, each
+    with its age and the role it has been given,
+  * a **config** characteristic (read + notify) — settings that only change
+    on command: SSID, broker URL, heater thresholds, the heating curve, the
+    actuator and the indoor topic, plus the running firmware version,
   * a **command** characteristic (write) — set Wi-Fi, set the MQTT broker,
-    choose water sensor, set heater thresholds, force heater off, start
-    heater,
+    give a sensor a role, set heater thresholds, force heater off, start
+    heater, adjust the heating curve and drive the shunt valve,
   * a **status** characteristic (read + notify) — result of the last command.
 * The link is encrypted and bonded (NimBLE "Just Works" pairing + LE Secure
   Connections). Bonds are stored in the ESP32's flash (NVS), so re-pairing is
@@ -69,7 +74,10 @@ templogctl set-wifi "MyHomeSSID" "supersecret"
 
 templogctl set-mqtt mqtt://192.168.2.10:1883
 
-templogctl set-water-sensor 28ff640000000000
+templogctl set-sensor-role 28ff640000000000 water    # drives the heater thermostat
+templogctl set-sensor-role 28aa550000000000 outdoor  # the curve is drawn from this one
+templogctl set-sensor-role 28bb660000000000 supply   # the one the shunt valve regulates
+templogctl set-sensor-role 28bb660000000000 none     # take a sensor out of service
 
 templogctl set-thresholds --on 60 --off 80
 
@@ -77,11 +85,25 @@ templogctl heater-off                 # resumes automatically once temp drops to
 templogctl heater-off --until-started # stays off until an explicit heater-on
 templogctl heater-on                  # starts heater unless water temp already >= off-threshold
 
+templogctl set-curve --slope 1.2 --offset -1 --target 21 --min 20 --max 70
+templogctl set-shunt --on --travel 120 --authority 50
+templogctl set-shunt --off             # stop driving the valve, leaving it where it is
+templogctl set-indoor --topic home/livingroom/temperature --gain 3 --max-trim 5 --stale 900
+templogctl set-indoor --topic ""       # switch the indoor trim off
+templogctl shunt-jog warmer 5          # run the actuator by hand, to check the wiring
+
 templogctl ota-update                 # install the latest GitHub release over the ESP32's Wi-Fi
 templogctl ota-update --tag v1.2.0    # install a specific release
 ```
 
-`templogctl status` prints the latest telemetry snapshot, e.g.:
+Every `set-curve`, `set-shunt` and `set-indoor` flag is optional: the settings
+left out keep their current values.
+
+The three read characteristics exist because a GATT client will not read more
+than 512 bytes of a single attribute value — Android's stack truncates there
+without saying so, and the sensor readings alone can approach that with eight
+sensors on the bus. `templog-ble` reads all three and merges them, so
+`templogctl status` still prints one document:
 
 ```json
 {
@@ -89,15 +111,30 @@ templogctl ota-update --tag v1.2.0    # install a specific release
   "connected": true,
   "telemetry": {
     "t": [
-      {"id": "28ff640000000000", "c": 62.3, "age": 1200, "water": true},
-      {"id": "28aa550000000000", "c": 21.4, "age": 1200, "water": false}
+      {"id": "28ff640000000000", "c": 62.3, "age": 1200, "role": "water"},
+      {"id": "28aa550000000000", "c": 1.4, "age": 1200, "role": "outdoor"},
+      {"id": "28bb660000000000", "c": 43.9, "age": 1200, "role": "supply"}
     ],
-    "wifi": {"c": true, "ssid": "MyHomeSSID"},
-    "mqtt": {"c": true, "url": "mqtt://192.168.2.10:1883"},
+    "wifi": {"c": true, "rssi": -55, "disc": 0},
+    "mqtt": {"c": true},
+    "ssid": "MyHomeSSID",
+    "url": "mqtt://192.168.2.10:1883",
     "heater": true,
     "onC": 60.0,
     "offC": 80.0,
     "forceState": 0,
+    "shunt": {
+      "en": true, "state": "running", "dir": "idle",
+      "sp": 44.6, "sup": 43.9, "out": 1.4, "pos": 0.42,
+      "in": 20.8, "inAge": 42000, "inFresh": true, "trim": 0.6
+    },
+    "curve": {
+      "slope": 1.2, "offset": -1.0, "target": 21.0, "min": 20.0, "max": 70.0,
+      "travel": 120, "authority": 50.0
+    },
+    "indoor": {
+      "topic": "home/livingroom/temperature", "gain": 3.0, "maxTrim": 5.0, "stale": 900
+    },
     "fw": "v1.2.0",
     "ota": {"state": "idle"}
   }
@@ -121,6 +158,45 @@ update: `state` is one of `idle`, `downloading` (with `pct` progress),
 `failed` (with `err`) or `verifying` (a freshly installed image that is
 rolled back unless it reaches Wi-Fi within two minutes). `ver` is the
 version being installed once known.
+
+## Shunt valve control
+
+Two GPIO outputs (18 and 19, which used to drive diagnostic LEDs) run a three
+point actuator on the radiator shunt valve: one makes it travel towards warmer,
+the other towards colder, and with neither energised it stays put. They are
+never energised at once.
+
+Control is open loop with respect to the house, like the panel it replaces. A
+heating curve turns the outdoor temperature into a supply ("framledning")
+temperature setpoint:
+
+    supply = target + slope × (target − outdoor) + offset + trim
+
+clamped to `min`..`max`. The loop that *is* closed is the one around the supply
+sensor: every 20 seconds the actuator is pulsed for a time proportional to the
+difference between setpoint and measured supply temperature. Because the
+actuator integrates those pulses, the supply temperature settles on the
+setpoint without a standing error. `travel` (its end to end run time) and
+`authority` (how much supply temperature that whole travel is worth) are what
+turn a temperature error into a pulse length; `shunt-jog` is there to measure
+the first and try out the second.
+
+`trim` comes from the indoor temperature, which this device does not measure:
+it subscribes to `indoorTopic` on the broker and expects a bare number. The
+trim is `gain × (target − indoor)`, limited to ±`maxTrim`, and it is applied
+**only while the reading is fresher than `stale` seconds** — a sensor that goes
+quiet or a broker outage therefore leaves the curve running on its own rather
+than leaving the house cold.
+
+The valve is held where it is, rather than driven blind, whenever the outdoor
+or supply reading is missing or more than two minutes old; `state` is then
+`holding` and `why` says which. `pos` is an estimate of how far the valve is
+open, integrated from run time rather than measured, and is only reported —
+the control loop follows the supply temperature, so a drifted estimate cannot
+stop the valve from reaching either end.
+
+The controller also mirrors itself onto MQTT as retained messages:
+`temp/1/shunt/state`, `temp/1/shunt/setpoint` and `temp/1/shunt/position`.
 
 `set-mqtt` restarts the ESP32's MQTT client against the new broker straight
 away and only persists the URL once the client accepts it, so a URL the client

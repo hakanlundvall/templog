@@ -17,13 +17,13 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -59,7 +59,11 @@ import io.github.hakanlundvall.templog.TemplogViewModel
 import io.github.hakanlundvall.templog.ble.ConnectionState
 import io.github.hakanlundvall.templog.ble.HeaterForceState
 import io.github.hakanlundvall.templog.ble.OtaState
+import io.github.hakanlundvall.templog.ble.IndoorStatus
 import io.github.hakanlundvall.templog.ble.SensorReading
+import io.github.hakanlundvall.templog.ble.SensorRole
+import io.github.hakanlundvall.templog.ble.ShuntDirection
+import io.github.hakanlundvall.templog.ble.ShuntStatus
 import io.github.hakanlundvall.templog.ble.Telemetry
 import io.github.hakanlundvall.templog.update.FirmwareRelease
 import java.util.Locale
@@ -141,6 +145,20 @@ fun TemplogScreen(
                             onEditThresholds = { dialog = Dialog.Thresholds },
                         )
                     }
+                    snapshot.shunt?.let { shunt ->
+                        item {
+                            ShuntCard(
+                                shunt = shunt,
+                                indoor = snapshot.indoor,
+                                enabled = state == ConnectionState.READY && !busy,
+                                onToggle = { viewModel.setShuntEnabled(!shunt.enabled) },
+                                onEditCurve = { dialog = Dialog.Curve },
+                                onEditActuator = { dialog = Dialog.Actuator },
+                                onEditIndoor = { dialog = Dialog.Indoor },
+                                onJog = { dir -> viewModel.jogShunt(dir, JOG_SECONDS) },
+                            )
+                        }
+                    }
                     item {
                         WifiCard(
                             telemetry = snapshot,
@@ -176,7 +194,7 @@ fun TemplogScreen(
                         SensorCard(
                             sensor = sensor,
                             enabled = state == ConnectionState.READY && !busy,
-                            onMakeWaterSensor = { viewModel.setWaterSensor(sensor.id) },
+                            onSetRole = { role -> viewModel.setSensorRole(sensor.id, role) },
                         )
                     }
                     item {
@@ -218,6 +236,33 @@ fun TemplogScreen(
             },
         )
 
+        Dialog.Curve -> CurveDialog(
+            shunt = telemetry?.shunt,
+            onDismiss = { dialog = null },
+            onConfirm = { slope, offset, target, min, max ->
+                dialog = null
+                viewModel.setCurve(slope, offset, target, min, max)
+            },
+        )
+
+        Dialog.Actuator -> ActuatorDialog(
+            shunt = telemetry?.shunt,
+            onDismiss = { dialog = null },
+            onConfirm = { travel, authority ->
+                dialog = null
+                viewModel.setActuator(travel, authority)
+            },
+        )
+
+        Dialog.Indoor -> IndoorDialog(
+            indoor = telemetry?.indoor,
+            onDismiss = { dialog = null },
+            onConfirm = { topic, gain, maxTrim, stale ->
+                dialog = null
+                viewModel.setIndoor(topic, gain, maxTrim, stale)
+            },
+        )
+
         is Dialog.Firmware -> FirmwareDialog(
             release = current.release,
             installed = telemetry?.firmwareVersion,
@@ -241,8 +286,14 @@ private sealed interface Dialog {
     data object Wifi : Dialog
     data object Mqtt : Dialog
     data object Thresholds : Dialog
+    data object Curve : Dialog
+    data object Actuator : Dialog
+    data object Indoor : Dialog
     data class Firmware(val release: FirmwareRelease) : Dialog
 }
+
+/** Long enough to see the actuator move, short enough to undo by hand. */
+private const val JOG_SECONDS = 5
 
 @Composable
 private fun ConnectionCard(
@@ -386,6 +437,376 @@ private fun HeaterCard(
             ) { Text("Edit thresholds") }
         }
     }
+}
+
+@Composable
+private fun ShuntCard(
+    shunt: ShuntStatus,
+    indoor: IndoorStatus?,
+    enabled: Boolean,
+    onToggle: () -> Unit,
+    onEditCurve: () -> Unit,
+    onEditActuator: () -> Unit,
+    onEditIndoor: () -> Unit,
+    onJog: (ShuntDirection) -> Unit,
+) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (shunt.direction == ShuntDirection.IDLE) {
+                MaterialTheme.colorScheme.surfaceVariant
+            } else {
+                MaterialTheme.colorScheme.tertiaryContainer
+            },
+        ),
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Shunt valve", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    when (shunt.direction) {
+                        ShuntDirection.WARMER -> "opening"
+                        ShuntDirection.COLDER -> "closing"
+                        ShuntDirection.IDLE -> shunt.state
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            }
+
+            Text(
+                "Supply " + (shunt.supplyC?.formatC() ?: "—") +
+                    ", aiming for " + (shunt.setpointC?.formatC() ?: "—"),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                "Outdoor " + (shunt.outdoorC?.formatC() ?: "—") +
+                    " · valve about ${(shunt.position * 100).toInt()}% open",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            shunt.reason?.let {
+                Text(
+                    "Holding: $it",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            Text(
+                "Curve: ${shunt.targetC.formatPlain()} °C indoors, slope " +
+                    shunt.slope.formatPlain() + ", offset " + shunt.offsetC.formatSigned() +
+                    " °C, between ${shunt.minSupplyC.formatPlain()} and " +
+                    "${shunt.maxSupplyC.formatPlain()} °C",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(indoorSummary(indoor), style = MaterialTheme.typography.bodySmall)
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilledTonalButton(
+                    onClick = onToggle,
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                ) { Text(if (shunt.enabled) "Stop" else "Start") }
+                OutlinedButton(
+                    onClick = onEditCurve,
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Curve") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = onEditActuator,
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Actuator") }
+                OutlinedButton(
+                    onClick = onEditIndoor,
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Indoor") }
+            }
+            // Moving the valve by hand is how the wiring gets checked and how
+            // the travel time is measured, so it stays available while
+            // automatic control is switched off.
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { onJog(ShuntDirection.COLDER) },
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Colder ${JOG_SECONDS}s") }
+                OutlinedButton(
+                    onClick = { onJog(ShuntDirection.WARMER) },
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                ) { Text("Warmer ${JOG_SECONDS}s") }
+            }
+        }
+    }
+}
+
+private fun indoorSummary(indoor: IndoorStatus?): String {
+    if (indoor == null || indoor.topic.isEmpty()) {
+        return "No indoor topic set, so the curve runs untrimmed."
+    }
+    val celsius = indoor.celsius
+        ?: return "Waiting for an indoor temperature on ${indoor.topic}."
+    if (!indoor.fresh) {
+        return "Indoor " + celsius.formatC() + " is too old to use" +
+            (indoor.ageMs?.let { " (${formatAge(it)})" } ?: "") + "; the curve runs untrimmed."
+    }
+    return "Indoor " + celsius.formatC() + ", trimming the supply by " +
+        indoor.trimC.formatSigned() + " °C."
+}
+
+@Composable
+private fun CurveDialog(
+    shunt: ShuntStatus?,
+    onDismiss: () -> Unit,
+    onConfirm: (slope: Double, offset: Double, target: Double, min: Double, max: Double) -> Unit,
+) {
+    var slope by remember { mutableStateOf(shunt?.slope?.formatPlain().orEmpty()) }
+    var offset by remember { mutableStateOf(shunt?.offsetC?.formatPlain().orEmpty()) }
+    var target by remember { mutableStateOf(shunt?.targetC?.formatPlain().orEmpty()) }
+    var min by remember { mutableStateOf(shunt?.minSupplyC?.formatPlain().orEmpty()) }
+    var max by remember { mutableStateOf(shunt?.maxSupplyC?.formatPlain().orEmpty()) }
+
+    val slopeValue = slope.toTemperature()
+    val offsetValue = offset.toTemperature()
+    val targetValue = target.toTemperature()
+    val minValue = min.toTemperature()
+    val maxValue = max.toTemperature()
+    val valid = slopeValue != null && offsetValue != null && targetValue != null &&
+        minValue != null && maxValue != null && minValue < maxValue
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Heating curve") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "The supply temperature is set from the outdoor temperature alone: " +
+                        "supply = target + slope × (target − outdoor) + offset. A steeper " +
+                        "slope adds more heat as it gets colder outside; the offset shifts " +
+                        "the whole curve up or down.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedTextField(
+                    value = target,
+                    onValueChange = { target = it },
+                    label = { Text("Indoor target (°C)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                OutlinedTextField(
+                    value = slope,
+                    onValueChange = { slope = it },
+                    label = { Text("Slope") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                OutlinedTextField(
+                    value = offset,
+                    onValueChange = { offset = it },
+                    label = { Text("Offset (°C)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = min,
+                        onValueChange = { min = it },
+                        label = { Text("Min supply") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                    )
+                    OutlinedTextField(
+                        value = max,
+                        onValueChange = { max = it },
+                        label = { Text("Max supply") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                if (valid) {
+                    // The two ends of a Swedish winter, so the numbers can be
+                    // sanity checked before they are sent.
+                    Text(
+                        "At +5 °C outside: " + curvePreview(slopeValue, offsetValue, targetValue, minValue, maxValue, 5.0) +
+                            ", at −15 °C: " + curvePreview(slopeValue, offsetValue, targetValue, minValue, maxValue, -15.0),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                } else {
+                    Text(
+                        "Every field must be a number, and the minimum supply " +
+                            "temperature must be below the maximum.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onConfirm(slopeValue ?: 0.0, offsetValue ?: 0.0, targetValue ?: 0.0, minValue ?: 0.0, maxValue ?: 0.0)
+                },
+                enabled = valid,
+            ) { Text("Apply") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+private fun curvePreview(
+    slope: Double,
+    offset: Double,
+    target: Double,
+    min: Double,
+    max: Double,
+    outdoor: Double,
+): String = (target + slope * (target - outdoor) + offset).coerceIn(min, max).formatC()
+
+@Composable
+private fun ActuatorDialog(
+    shunt: ShuntStatus?,
+    onDismiss: () -> Unit,
+    onConfirm: (travelS: Int, authorityC: Double) -> Unit,
+) {
+    var travel by remember { mutableStateOf(shunt?.travelS?.toString().orEmpty()) }
+    var authority by remember { mutableStateOf(shunt?.authorityC?.formatPlain().orEmpty()) }
+
+    val travelValue = travel.trim().toIntOrNull()
+    val authorityValue = authority.toTemperature()
+    val valid = travelValue != null && travelValue in 5..600 &&
+        authorityValue != null && authorityValue > 0
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Actuator") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "These two set how hard each correction pushes. Time the valve " +
+                        "from one end to the other with the jog buttons, and put in " +
+                        "roughly how much the supply temperature changes over that " +
+                        "whole travel.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedTextField(
+                    value = travel,
+                    onValueChange = { travel = it },
+                    label = { Text("Travel time, end to end (s)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                OutlinedTextField(
+                    value = authority,
+                    onValueChange = { authority = it },
+                    label = { Text("Supply span of that travel (°C)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                if (!valid) {
+                    Text(
+                        "Travel time must be 5–600 s and the span a positive number.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(travelValue ?: 0, authorityValue ?: 0.0) },
+                enabled = valid,
+            ) { Text("Apply") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun IndoorDialog(
+    indoor: IndoorStatus?,
+    onDismiss: () -> Unit,
+    onConfirm: (topic: String, gain: Double, maxTrim: Double, staleS: Int) -> Unit,
+) {
+    var topic by remember { mutableStateOf(indoor?.topic.orEmpty()) }
+    var gain by remember { mutableStateOf(indoor?.gain?.formatPlain().orEmpty()) }
+    var maxTrim by remember { mutableStateOf(indoor?.maxTrimC?.formatPlain().orEmpty()) }
+    var stale by remember { mutableStateOf(indoor?.staleS?.toString().orEmpty()) }
+
+    val gainValue = gain.toTemperature()
+    val maxTrimValue = maxTrim.toTemperature()
+    val staleValue = stale.trim().toIntOrNull()
+    val valid = gainValue != null && gainValue >= 0 && maxTrimValue != null &&
+        maxTrimValue >= 0 && staleValue != null && staleValue >= 60
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Indoor trim") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "The device does not measure indoors itself; it subscribes to a " +
+                        "topic on the broker. A reading older than the limit below is " +
+                        "ignored, so a sensor that goes quiet cannot leave the house " +
+                        "cold. Leave the topic empty to switch the trim off.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedTextField(
+                    value = topic,
+                    onValueChange = { topic = it },
+                    label = { Text("MQTT topic") },
+                    placeholder = { Text("home/livingroom/temperature") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = gain,
+                    onValueChange = { gain = it },
+                    label = { Text("Supply degrees per degree indoors") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                OutlinedTextField(
+                    value = maxTrim,
+                    onValueChange = { maxTrim = it },
+                    label = { Text("Largest trim either way (°C)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                OutlinedTextField(
+                    value = stale,
+                    onValueChange = { stale = it },
+                    label = { Text("Ignore readings older than (s)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                if (!valid) {
+                    Text(
+                        "Gain and trim limit cannot be negative, and the staleness " +
+                            "limit must be at least 60 s.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onConfirm(topic.trim(), gainValue ?: 0.0, maxTrimValue ?: 0.0, staleValue ?: 0)
+                },
+                enabled = valid,
+            ) { Text("Apply") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
@@ -714,7 +1135,11 @@ private fun TransferOption(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SensorCard(sensor: SensorReading, enabled: Boolean, onMakeWaterSensor: () -> Unit) {
+private fun SensorCard(
+    sensor: SensorReading,
+    enabled: Boolean,
+    onSetRole: (SensorRole) -> Unit,
+) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(
@@ -736,21 +1161,24 @@ private fun SensorCard(sensor: SensorReading, enabled: Boolean, onMakeWaterSenso
                     style = MaterialTheme.typography.titleMedium,
                 )
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (sensor.isWaterSensor) {
-                    AssistChip(onClick = {}, enabled = false, label = { Text("water sensor") })
-                    Spacer(Modifier.width(8.dp))
-                }
-                sensor.ageMs?.let {
-                    Text(
-                        "read ${formatAge(it)} ago",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
+            sensor.ageMs?.let {
+                Text(
+                    "read ${formatAge(it)} ago",
+                    style = MaterialTheme.typography.bodySmall,
+                )
             }
-            if (!sensor.isWaterSensor) {
-                TextButton(onClick = onMakeWaterSensor, enabled = enabled) {
-                    Text("Use as water sensor")
+            // Which job this sensor does. Picking the role it already has
+            // clears it, so a sensor can be taken out of service too.
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (role in listOf(SensorRole.WATER, SensorRole.OUTDOOR, SensorRole.SUPPLY)) {
+                    FilterChip(
+                        selected = sensor.role == role,
+                        onClick = {
+                            onSetRole(if (sensor.role == role) SensorRole.NONE else role)
+                        },
+                        enabled = enabled,
+                        label = { Text(role.label) },
+                    )
                 }
             }
         }
@@ -876,6 +1304,12 @@ private fun Double.formatC(): String =
     if (isNaN()) "—" else String.format(Locale.US, "%.1f °C", this)
 
 private fun Double.formatPlain(): String = String.format(Locale.US, "%.1f", this)
+
+/** For a correction, where the sign is the point: "+1.5", "-0.5", "0.0". */
+private fun Double.formatSigned(): String = String.format(Locale.US, "%+.1f", this)
+
+/** Accepts a comma as the decimal separator, which a Swedish keyboard gives. */
+private fun String.toTemperature(): Double? = trim().replace(',', '.').toDoubleOrNull()
 
 private fun formatAge(ms: Long): String {
     val seconds = ms / 1000

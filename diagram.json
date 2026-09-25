@@ -12,15 +12,30 @@
     },
     {
       "type": "wokwi-led",
-      "id": "led-red",
+      "id": "led-warm",
       "top": -80.4,
       "left": -159,
-      "attrs": { "color": "red", "flip": "1", "label": "WiFi" }
+      "attrs": { "color": "red", "flip": "1", "label": "Warmer" }
     },
     {
       "type": "wokwi-resistor",
       "id": "r1",
       "top": -72,
+      "left": -202.15,
+      "rotate": 90,
+      "attrs": { "value": "1000" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led-cold",
+      "top": -28.8,
+      "left": -159,
+      "attrs": { "color": "blue", "flip": "1", "label": "Colder" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r3",
+      "top": -20.4,
       "left": -202.15,
       "rotate": 90,
       "attrs": { "value": "1000" }
@@ -44,9 +59,12 @@
   "connections": [
     [ "esp:TX", "$serialMonitor:RX", "", [] ],
     [ "esp:RX", "$serialMonitor:TX", "", [] ],
-    [ "esp:GND.2", "led-red:C", "black", [ "v0", "h57.6" ] ],
-    [ "led-red:A", "r1:2", "green", [ "v0" ] ],
-    [ "esp:19", "r1:1", "green", [ "h19.2", "v-163.2" ] ],
+    [ "esp:GND.2", "led-warm:C", "black", [ "v0", "h57.6" ] ],
+    [ "led-warm:A", "r1:2", "green", [ "v0" ] ],
+    [ "esp:18", "r1:1", "green", [ "h19.2", "v-163.2" ] ],
+    [ "esp:GND.2", "led-cold:C", "black", [ "v0", "h62.4" ] ],
+    [ "led-cold:A", "r3:2", "blue", [ "v0" ] ],
+    [ "esp:19", "r3:1", "blue", [ "h14.4", "v-110.4" ] ],
     [ "esp:5V", "temp1:VCC", "red", [ "h-19.05", "v19.2", "h172.8" ] ],
     [ "esp:25", "temp1:DQ", "green", [ "v9.6", "h-28.65", "v124.8", "h172.8" ] ],
     [ "esp:GND.2", "temp1:GND", "black", [ "v0", "h28.8", "v144", "h9.6" ] ],

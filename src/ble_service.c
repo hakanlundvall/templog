@@ -457,6 +457,12 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
                  event->connect.status);
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
+            /* A bonded client caches this service definition, and Android
+             * keeps handing the app that cached copy: a characteristic added
+             * by a firmware update stays invisible until the bond is deleted
+             * by hand. Saying on every connection that the database changed
+             * makes the client rediscover instead. */
+            ble_svc_gatt_changed(0x0001, 0xffff);
         } else {
             start_advertising();
         }

@@ -90,6 +90,9 @@ class TemplogBleClient(context: Context) {
     /** The newest copy of each reported document, keyed by characteristic. */
     private val documents = linkedMapOf<UUID, JSONObject>()
 
+    /** Guards against rediscovering in a loop on a device that really is old. */
+    private var cacheRefreshed = false
+
     private val _deviceAddress = MutableStateFlow<String?>(null)
     val deviceAddress: StateFlow<String?> = _deviceAddress.asStateFlow()
 
@@ -346,6 +349,7 @@ class TemplogBleClient(context: Context) {
         // the new one's, which matters if the device was reconfigured or
         // reflashed while it was away.
         documents.clear()
+        cacheRefreshed = false
         gatt?.let {
             runCatching { it.disconnect() }
             runCatching { it.close() }
@@ -474,6 +478,20 @@ class TemplogBleClient(context: Context) {
     private fun characteristic(uuid: UUID): BluetoothGattCharacteristic? =
         gatt?.getService(Protocol.SERVICE_UUID)?.getCharacteristic(uuid)
 
+    /**
+     * Clears Android's cached copy of this device's GATT database. There is no
+     * public API for it, only a hidden `refresh()`, and recent Android blocks
+     * that for an app targeting a modern SDK - so this often fails, which is
+     * harmless: it just leaves the cache in place, and the user clears it by
+     * forgetting the device in Bluetooth settings.
+     */
+    private fun refreshGattCache(gatt: BluetoothGatt): Boolean = runCatching {
+        gatt.javaClass.getMethod("refresh").invoke(gatt) as? Boolean ?: false
+    }.getOrElse {
+        Log.w(TAG, "could not refresh the cached GATT database", it)
+        false
+    }
+
     private fun subscribe(gatt: BluetoothGatt, uuid: UUID): Boolean {
         val characteristic = characteristic(uuid) ?: return false
         if (!gatt.setCharacteristicNotification(characteristic, true)) return false
@@ -574,11 +592,29 @@ class TemplogBleClient(context: Context) {
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             handler.post {
                 if (g !== gatt) return@post
-                if (status != BluetoothGatt.GATT_SUCCESS || g.getService(Protocol.SERVICE_UUID) == null) {
+                val service = g.getService(Protocol.SERVICE_UUID)
+                if (status != BluetoothGatt.GATT_SUCCESS || service == null) {
                     _lastError.value = "templog GATT service not found on this device"
                     teardownGatt()
                     scheduleReconnect()
                     return@post
+                }
+                // Android caches a bonded device's service list and keeps
+                // serving it after the device has been updated, so a
+                // characteristic a newer firmware added simply is not there.
+                // The device says so itself with a Service Changed
+                // indication, which the Bluetooth stack acts on without the
+                // app's help; this is the fallback for a phone that was
+                // already bonded before the firmware learned to send it.
+                if (REPORT_CHARS.any { service.getCharacteristic(it) == null }) {
+                    if (!cacheRefreshed) {
+                        cacheRefreshed = true
+                        Log.i(TAG, "characteristics missing; refreshing the cached GATT database")
+                        refreshGattCache(g)
+                        g.discoverServices()
+                        return@post
+                    }
+                    Log.w(TAG, "device is missing characteristics this app expects")
                 }
                 // Subscribing touches an encrypted characteristic, which is
                 // what triggers pairing on a fresh device.
@@ -603,6 +639,20 @@ class TemplogBleClient(context: Context) {
                     Log.w(TAG, "descriptor write failed: $status")
                 }
                 opComplete()
+            }
+        }
+
+        /**
+         * The device says its GATT database changed, which is how a firmware
+         * update announces new characteristics to an already bonded phone.
+         * Only delivered from Android 12 onwards.
+         */
+        override fun onServiceChanged(g: BluetoothGatt) {
+            handler.post {
+                if (g !== gatt) return@post
+                Log.i(TAG, "device reports a changed GATT database; rediscovering")
+                documents.clear()
+                g.discoverServices()
             }
         }
 

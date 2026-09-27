@@ -21,6 +21,7 @@
 #include "lwip/sys.h"
 
 #include "mqtt_client.h"
+#include "esp_crt_bundle.h"
 #include "freertos/queue.h"
 #include <math.h>
 #include <stdlib.h>
@@ -377,38 +378,120 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-static esp_mqtt_client_handle_t mqtt_app_start(void)
+static char mqtt_status_topic[] = "temp/1/status";
+
+/* The scheme of the broker URL picks the transport, and with it the port to
+ * use when the URL does not spell one out. */
+typedef struct
+{
+    const char *prefix;
+    uint32_t default_port;
+} mqtt_scheme_t;
+
+static const mqtt_scheme_t mqtt_schemes[] = {
+    {"mqtt://", 1883},
+    {"mqtts://", 8883},
+    {"ws://", 80},
+    {"wss://", 443},
+};
+
+static const mqtt_scheme_t *mqtt_scheme_of(const char *broker_url)
+{
+    for (size_t i = 0; i < sizeof(mqtt_schemes) / sizeof(mqtt_schemes[0]); ++i)
+    {
+        if (strncasecmp(broker_url, mqtt_schemes[i].prefix, strlen(mqtt_schemes[i].prefix)) == 0)
+        {
+            return &mqtt_schemes[i];
+        }
+    }
+    return NULL;
+}
+
+/* Whether the authority carries an explicit ":port". Userinfo is skipped first
+ * so the colon in "user:pass@host" does not count as one, and the search stops
+ * where the path begins so a colon there does not either. */
+static bool mqtt_url_has_port(const char *broker_url, const mqtt_scheme_t *scheme)
+{
+    const char *authority = broker_url + strlen(scheme->prefix);
+    const char *path = strpbrk(authority, "/?#");
+    const char *at = strchr(authority, '@');
+    if (at != NULL && (path == NULL || at < path))
+    {
+        authority = at + 1;
+    }
+    const char *colon = strchr(authority, ':');
+    return colon != NULL && (path == NULL || colon < path);
+}
+
+/* Builds the client configuration for whatever `url` currently holds. Rejecting
+ * an unknown scheme here is worth the check: esp-mqtt would otherwise take the
+ * URL and produce a client that never connects. */
+static bool mqtt_make_config(esp_mqtt_client_config_t *cfg, const char **error)
 {
     static char lwt_msg[] = "disconnected";
-    static char connect_msg[] = "start";
-    static char status_topic[] = "temp/1/status";
-    if (!has_mqtt_config())
+
+    const mqtt_scheme_t *scheme = mqtt_scheme_of(url);
+    if (scheme == NULL)
     {
-        ESP_LOGW(TAG, "No MQTT broker stored; waiting for a set_mqtt command over BLE");
-        return NULL;
+        ESP_LOGE(TAG, "Broker URL has no usable scheme: %s", url);
+        *error = "url must start with mqtt://, mqtts://, ws:// or wss://";
+        return false;
     }
 
-    esp_mqtt_client_config_t mqtt_cfg = {
+    *cfg = (esp_mqtt_client_config_t){
         .broker.address.uri = url,
+        /* mqtts:// and wss:// verify the broker against the certificate bundle
+         * compiled into the firmware, the same one the OTA download uses. A
+         * broker presenting a privately signed certificate is not supported. */
+        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
         .session.last_will.msg = lwt_msg,
         .session.last_will.msg_len = sizeof(lwt_msg) - 1,
         .session.last_will.qos = 1,
-        .session.last_will.topic = status_topic,
+        .session.last_will.topic = mqtt_status_topic,
         .session.last_will.retain = 0,
         .session.keepalive = 9,
     };
+
+    /* esp-mqtt only takes a port from the URL when one is present, and keeps
+     * the port of the previously configured broker otherwise - so switching
+     * from mqtt://host:1883 to mqtts://host would keep talking to 1883. */
+    if (!mqtt_url_has_port(url, scheme))
+    {
+        cfg->broker.address.port = scheme->default_port;
+        ESP_LOGI(TAG, "Broker URL has no port; using %lu for %s",
+                 (unsigned long)scheme->default_port, scheme->prefix);
+    }
+    return true;
+}
+
+static esp_mqtt_client_handle_t mqtt_app_start(const char **error)
+{
+    static char connect_msg[] = "start";
+    if (!has_mqtt_config())
+    {
+        ESP_LOGW(TAG, "No MQTT broker stored; waiting for a set_mqtt command over BLE");
+        *error = "no broker configured";
+        return NULL;
+    }
+
+    esp_mqtt_client_config_t mqtt_cfg;
+    if (!mqtt_make_config(&mqtt_cfg, error))
+    {
+        return NULL;
+    }
 
     ESP_LOGI(TAG, "Starting MQTT client URL: %s", url);
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
     if (client == NULL)
     {
         ESP_LOGE(TAG, "esp_mqtt_client_init failed for URL: %s", url);
+        *error = "could not start the MQTT client";
         return NULL;
     }
     /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
-    esp_mqtt_client_publish(client, status_topic, connect_msg, sizeof(connect_msg) - 1, 1, 0);
+    esp_mqtt_client_publish(client, mqtt_status_topic, connect_msg, sizeof(connect_msg) - 1, 1, 0);
 
     g_mqtt_client = client;
     return client;
@@ -640,9 +723,8 @@ static bool apply_mqtt_config(const char **error)
     {
         /* The device booted without a broker, so there is nothing to retarget;
          * create the client now instead. */
-        if (mqtt_app_start() == NULL)
+        if (mqtt_app_start(error) == NULL)
         {
-            *error = "could not start the MQTT client";
             return false;
         }
         return true;
@@ -651,10 +733,18 @@ static bool apply_mqtt_config(const char **error)
     esp_mqtt_client_stop(g_mqtt_client);
     s_mqtt_connected = false;
 
-    esp_err_t ret = esp_mqtt_client_set_uri(g_mqtt_client, url);
+    /* The whole configuration is reapplied rather than just the URI, because
+     * the transport and the port both follow from the scheme. */
+    esp_mqtt_client_config_t mqtt_cfg;
+    if (!mqtt_make_config(&mqtt_cfg, error))
+    {
+        return false;
+    }
+
+    esp_err_t ret = esp_mqtt_set_config(g_mqtt_client, &mqtt_cfg);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "esp_mqtt_client_set_uri failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "esp_mqtt_set_config failed: %s", esp_err_to_name(ret));
         *error = "broker URL rejected";
         return false;
     }
@@ -1173,7 +1263,11 @@ _Noreturn void app_main()
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
-    mqtt_app_start();
+    const char *mqtt_error = NULL;
+    if (mqtt_app_start(&mqtt_error) == NULL && has_mqtt_config())
+    {
+        ESP_LOGE(TAG, "MQTT client not started: %s", mqtt_error);
+    }
     xTaskCreate(connection_monitor_task, "connection_monitor", 4096, NULL, 5, NULL);
     // Stable readings require a brief period before communication
     vTaskDelay(2000.0 / portTICK_PERIOD_MS);

@@ -117,6 +117,15 @@ class TemplogBleClient(context: Context) {
     /** Command writers waiting for a status reply, keyed by the "cmd" field. */
     private val pendingCommands = mutableMapOf<String, MutableList<CompletableDeferred<CommandStatus>>>()
 
+    /** How often the current connection has had a rediscovery turned down. */
+    private var rediscoverAttempts = 0
+
+    /** How often in a row the stack has refused to start a queued operation. */
+    private var startFailures = 0
+
+    /** How often this connection has replayed an operation waiting for encryption. */
+    private var encryptionRetries = 0
+
     private var bondReceiverRegistered = false
 
     /** Negotiated ATT MTU, which decides how large a firmware chunk can be. */
@@ -140,6 +149,7 @@ class TemplogBleClient(context: Context) {
         handler.post {
             running = false
             handler.removeCallbacks(reconnectRunnable)
+            cancelSetupWatchdog()
             stopScan()
             teardownGatt()
             failAllPendingCommands("disconnected")
@@ -281,6 +291,7 @@ class TemplogBleClient(context: Context) {
     private val reconnectRunnable = Runnable { connectNow() }
 
     private fun scheduleReconnect() {
+        cancelSetupWatchdog()
         if (!running) return
         _connectionState.value = ConnectionState.IDLE
         Log.i(TAG, "reconnecting in ${backoffMs}ms")
@@ -288,6 +299,41 @@ class TemplogBleClient(context: Context) {
         handler.postDelayed(reconnectRunnable, backoffMs)
         backoffMs = (backoffMs * 2).coerceAtMost(MAX_BACKOFF_MS)
     }
+
+    /**
+     * Drops the link and goes back to the reconnect loop. Everything that
+     * gives up on a connection goes through here, so a half set up link is
+     * never left behind with no way out of it.
+     */
+    private fun restartLink(reason: String) {
+        Log.w(TAG, "restarting the link: $reason")
+        _lastError.value = reason
+        teardownGatt()
+        failAllPendingCommands(reason)
+        scheduleReconnect()
+    }
+
+    /**
+     * Fires if a connection does not reach [ConnectionState.READY] in time.
+     *
+     * Connecting, pairing and discovery are all driven by callbacks from the
+     * Bluetooth stack, and there is no guarantee that any of them arrives: a
+     * dropped callback, or an operation the stack refuses to start, used to
+     * leave the client sitting in [ConnectionState.DISCOVERING] for good, with
+     * the Reconnect button as the only way out. This is what makes that case
+     * recover on its own instead.
+     */
+    private val setupTimeoutRunnable = Runnable {
+        restartLink("the device did not finish connecting in time")
+    }
+
+    /** (Re)starts the setup watchdog, called again at every step forward. */
+    private fun armSetupWatchdog() {
+        handler.removeCallbacks(setupTimeoutRunnable)
+        handler.postDelayed(setupTimeoutRunnable, SETUP_TIMEOUT_MS)
+    }
+
+    private fun cancelSetupWatchdog() = handler.removeCallbacks(setupTimeoutRunnable)
 
     private fun connectNow() {
         if (!running) return
@@ -334,17 +380,23 @@ class TemplogBleClient(context: Context) {
         teardownGatt()
         _connectionState.value = ConnectionState.CONNECTING
         Log.i(TAG, "connecting to ${target.address}")
+        armSetupWatchdog()
         gatt = target.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         if (gatt == null) {
+            cancelSetupWatchdog()
             _lastError.value = "could not open a GATT connection"
             scheduleReconnect()
         }
     }
 
     private fun teardownGatt() {
-        queue.clear()
+        handler.removeCallbacks(rediscoverRunnable)
+        handler.removeCallbacks(drainRunnable)
+        discardQueued("disconnected")
         pending = null
-        awaitingBond.clear()
+        rediscoverAttempts = 0
+        encryptionRetries = 0
+        startFailures = 0
         // Documents from the old connection would otherwise be merged with
         // the new one's, which matters if the device was reconfigured or
         // reflashed while it was away.
@@ -441,6 +493,8 @@ class TemplogBleClient(context: Context) {
         drain()
     }
 
+    private val drainRunnable = Runnable { drain() }
+
     private fun drain() {
         if (pending != null) return
         val gatt = this.gatt ?: return
@@ -454,12 +508,32 @@ class TemplogBleClient(context: Context) {
             is Op.Write -> write(gatt, op)
         }
 
-        if (!started) {
-            Log.w(TAG, "failed to start $op")
-            failOp(op, "could not start GATT operation")
-            pending = null
-            drain()
+        if (started) {
+            startFailures = 0
+            return
         }
+        pending = null
+
+        // Only a write reports a refused start back to its caller, so a read
+        // or a subscribe that could not be started used to disappear without a
+        // trace - and during setup that left the queue quietly empty and the
+        // connection never ready. A refusal here is usually temporary: the
+        // stack turns an operation down while it is busy with something the
+        // queue did not start, above all a service discovery, and while a
+        // discovery is running the characteristic cannot be named either. So
+        // put it back and try again shortly.
+        if (startFailures++ < MAX_START_RETRIES) {
+            Log.i(TAG, "could not start $op yet; retrying")
+            queue.addFirst(op)
+            handler.removeCallbacks(drainRunnable)
+            handler.postDelayed(drainRunnable, START_RETRY_MS)
+            return
+        }
+
+        Log.w(TAG, "giving up on $op")
+        failOp(op, "could not start GATT operation")
+        startFailures = 0
+        drain()
     }
 
     private fun opComplete() {
@@ -469,6 +543,15 @@ class TemplogBleClient(context: Context) {
 
     private fun failOp(op: Op, reason: String) {
         if (op is Op.Write) op.onFailure?.invoke(reason)
+    }
+
+    /**
+     * Throws away operations queued against a database that has gone away,
+     * telling the writers among them why rather than leaving them to time out.
+     */
+    private fun discardQueued(reason: String) {
+        while (true) failOp(queue.poll() ?: break, reason)
+        while (true) failOp(awaitingBond.poll() ?: break, reason)
     }
 
     private fun succeedOp(op: Op?) {
@@ -490,6 +573,38 @@ class TemplogBleClient(context: Context) {
     }.getOrElse {
         Log.w(TAG, "could not refresh the cached GATT database", it)
         false
+    }
+
+    private val rediscoverRunnable = Runnable { rediscover() }
+
+    /**
+     * Reads the device's GATT database again, and keeps trying until the stack
+     * accepts the request.
+     *
+     * [BluetoothGatt.discoverServices] is turned down while an operation it
+     * started is still outstanding, which is exactly the case when a Service
+     * Changed indication lands in the middle of subscribing and reading - the
+     * firmware sends one on every connection. Ignoring that refusal left
+     * Android with no cached database, the app with a queue of operations that
+     * could no longer name a characteristic, and the connection stuck in
+     * [ConnectionState.DISCOVERING] until the user pressed Reconnect. Waiting
+     * for the outstanding operation to drain and asking again is all it takes.
+     */
+    private fun rediscover() {
+        handler.removeCallbacks(rediscoverRunnable)
+        val g = gatt ?: return
+        documents.clear()
+        armSetupWatchdog()
+        if (g.discoverServices()) {
+            rediscoverAttempts = 0
+            return
+        }
+        if (rediscoverAttempts++ < MAX_REDISCOVER_ATTEMPTS) {
+            Log.i(TAG, "rediscovery turned down; retrying")
+            handler.postDelayed(rediscoverRunnable, REDISCOVER_RETRY_MS)
+        } else {
+            restartLink("service discovery could not be started")
+        }
     }
 
     private fun subscribe(gatt: BluetoothGatt, uuid: UUID): Boolean {
@@ -536,11 +651,33 @@ class TemplogBleClient(context: Context) {
         status == GATT_INSUFFICIENT_AUTHENTICATION || status == GATT_INSUFFICIENT_ENCRYPTION
 
     private fun deferUntilBonded(op: Op) {
+        val target = device
+        if (target != null && target.bondState == BluetoothDevice.BOND_BONDED) {
+            // The bond is already there, so no bond state change is coming and
+            // waiting for one would wait for ever. What is missing is
+            // encryption on this link, which Android starts by itself when it
+            // sees this error; the operation only has to be tried again once
+            // that has landed.
+            retryOnceEncrypted(op)
+            return
+        }
         _connectionState.value = ConnectionState.PAIRING
         awaitingBond.add(op)
         // Android normally starts pairing itself when it sees these errors;
         // asking explicitly covers the stacks that do not.
-        device?.let { if (it.bondState == BluetoothDevice.BOND_NONE) runCatching { it.createBond() } }
+        target?.let { if (it.bondState == BluetoothDevice.BOND_NONE) runCatching { it.createBond() } }
+    }
+
+    /** Replays [op] shortly, once Android has had time to encrypt the link. */
+    private fun retryOnceEncrypted(op: Op) {
+        if (encryptionRetries >= MAX_ENCRYPTION_RETRIES) {
+            restartLink("the device would not accept an encrypted operation")
+            return
+        }
+        encryptionRetries++
+        _connectionState.value = ConnectionState.PAIRING
+        val g = gatt
+        handler.postDelayed({ if (gatt === g) enqueue(op) }, ENCRYPTION_RETRY_MS)
     }
 
     // ---------------------------------------------------------- GATT callbacks
@@ -557,8 +694,12 @@ class TemplogBleClient(context: Context) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         Log.i(TAG, "connected, negotiating MTU")
                         _connectionState.value = ConnectionState.DISCOVERING
-                        queue.clear()
+                        armSetupWatchdog()
+                        discardQueued("reconnected")
                         pending = null
+                        rediscoverAttempts = 0
+                        encryptionRetries = 0
+                        startFailures = 0
                         enqueue(Op.RequestMtu(PREFERRED_MTU))
                     }
 
@@ -581,11 +722,7 @@ class TemplogBleClient(context: Context) {
                 Log.i(TAG, "mtu=$mtu status=$status")
                 if (status == BluetoothGatt.GATT_SUCCESS) this@TemplogBleClient.mtu = mtu
                 opComplete()
-                if (!g.discoverServices()) {
-                    _lastError.value = "service discovery could not be started"
-                    teardownGatt()
-                    scheduleReconnect()
-                }
+                rediscover()
             }
         }
 
@@ -594,11 +731,20 @@ class TemplogBleClient(context: Context) {
                 if (g !== gatt) return@post
                 val service = g.getService(Protocol.SERVICE_UUID)
                 if (status != BluetoothGatt.GATT_SUCCESS || service == null) {
-                    _lastError.value = "templog GATT service not found on this device"
-                    teardownGatt()
-                    scheduleReconnect()
+                    restartLink("templog GATT service not found on this device")
                     return@post
                 }
+                armSetupWatchdog()
+                rediscoverAttempts = 0
+                // The stack runs one operation at a time per connection, so a
+                // discovery that has completed means anything still marked
+                // pending - an operation the device changing its database
+                // underneath us cost its callback - will never report back.
+                // Releasing it here is what keeps the queue from jamming for
+                // good, which is how the client used to end up stuck.
+                pending?.let { failOp(it, "the device's GATT database changed") }
+                pending = null
+                discardQueued("the device's GATT database changed")
                 // Android caches a bonded device's service list and keeps
                 // serving it after the device has been updated, so a
                 // characteristic a newer firmware added simply is not there.
@@ -611,7 +757,7 @@ class TemplogBleClient(context: Context) {
                         cacheRefreshed = true
                         Log.i(TAG, "characteristics missing; refreshing the cached GATT database")
                         refreshGattCache(g)
-                        g.discoverServices()
+                        rediscover()
                         return@post
                     }
                     Log.w(TAG, "device is missing characteristics this app expects")
@@ -651,8 +797,12 @@ class TemplogBleClient(context: Context) {
             handler.post {
                 if (g !== gatt) return@post
                 Log.i(TAG, "device reports a changed GATT database; rediscovering")
-                documents.clear()
-                g.discoverServices()
+                // Android has just thrown away its cached copy, so anything
+                // still queued would be started against characteristics that
+                // are momentarily not there. The discovery that follows queues
+                // a fresh batch.
+                discardQueued("the device's GATT database changed")
+                rediscover()
             }
         }
 
@@ -736,6 +886,8 @@ class TemplogBleClient(context: Context) {
                         .onSuccess {
                             _telemetry.value = it
                             backoffMs = MIN_BACKOFF_MS
+                            encryptionRetries = 0
+                            cancelSetupWatchdog()
                             _connectionState.value = ConnectionState.READY
                         }
                         .onFailure { Log.w(TAG, "bad telemetry JSON from $uuid: $json", it) }
@@ -810,17 +962,15 @@ class TemplogBleClient(context: Context) {
                 BluetoothDevice.BOND_BONDED -> handler.post {
                     Log.i(TAG, "bonded with ${changed.address}")
                     _connectionState.value = ConnectionState.DISCOVERING
+                    armSetupWatchdog()
                     while (true) enqueue(awaitingBond.poll() ?: break)
                     drain()
                 }
 
                 BluetoothDevice.BOND_NONE -> handler.post {
                     if (awaitingBond.isNotEmpty()) {
-                        awaitingBond.forEach { failOp(it, "pairing was rejected") }
-                        awaitingBond.clear()
-                        _lastError.value = "pairing with the device failed"
-                        teardownGatt()
-                        scheduleReconnect()
+                        while (true) failOp(awaitingBond.poll() ?: break, "pairing was rejected")
+                        restartLink("pairing with the device failed")
                     }
                 }
             }
@@ -880,6 +1030,25 @@ class TemplogBleClient(context: Context) {
         private const val MAX_BACKOFF_MS = 30_000L
         private const val SCAN_TIMEOUT_MS = 10_000L
         private const val DEFAULT_MTU = 23
+
+        /**
+         * How long a connection has to reach [ConnectionState.READY], counted
+         * again from every step it takes. Generous, because pairing is part of
+         * it on a device that has not been seen before.
+         */
+        private const val SETUP_TIMEOUT_MS = 30_000L
+
+        /** How long to wait for an outstanding operation before rediscovering. */
+        private const val REDISCOVER_RETRY_MS = 250L
+        private const val MAX_REDISCOVER_ATTEMPTS = 20
+
+        /** How long to wait before offering a refused operation again. */
+        private const val START_RETRY_MS = 250L
+        private const val MAX_START_RETRIES = 20
+
+        /** How long to give Android to encrypt the link before trying again. */
+        private const val ENCRYPTION_RETRY_MS = 500L
+        private const val MAX_ENCRYPTION_RETRIES = 6
 
         /** ATT opcode plus attribute handle, which every write carries. */
         private const val ATT_WRITE_OVERHEAD = 3

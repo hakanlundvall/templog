@@ -396,6 +396,18 @@ private fun HeaterCard(
                 "Water temperature: " + (water?.celsius?.formatC() ?: "no water sensor selected"),
                 style = MaterialTheme.typography.bodyMedium,
             )
+            if (!telemetry.hasWaterTemperature) {
+                Text(
+                    if (water == null) {
+                        "Give a sensor the water role to start the heater: " +
+                            "without one, nothing would tell it to stop."
+                    } else {
+                        "The water reading is missing or too old, so the heater cannot be started."
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
             Text(
                 "Thresholds: on at/below ${telemetry.heaterOnThresholdC.formatC()}, " +
                     "off at/above ${telemetry.heaterOffThresholdC.formatC()}",
@@ -421,7 +433,7 @@ private fun HeaterCard(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilledTonalButton(
                     onClick = onHeaterOn,
-                    enabled = enabled,
+                    enabled = enabled && telemetry.hasWaterTemperature,
                     modifier = Modifier.weight(1f),
                 ) { Text("Start") }
                 FilledTonalButton(
@@ -432,7 +444,7 @@ private fun HeaterCard(
             }
             OutlinedButton(
                 onClick = onHeaterOnce,
-                enabled = enabled,
+                enabled = enabled && telemetry.hasWaterTemperature,
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Heat once, then off until started") }
             OutlinedButton(

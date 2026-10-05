@@ -215,6 +215,9 @@ def main() -> None:
     )
     p.set_defaults(func=cmd_heater_off)
 
+    # Both of these are refused unless a sensor in the water role has produced
+    # a reading recently: that reading is the only thing that ever stops the
+    # heater, so without it there would be nothing to stop it.
     p = sub.add_parser("heater-on", help="Start the heater (unless water temperature is already above the off threshold)")
     p.set_defaults(func=cmd_heater_on)
 

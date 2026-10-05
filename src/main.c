@@ -98,6 +98,12 @@ static QueueHandle_t g_ble_cmd_queue;
 static OneWireBus_ROMCode device_rom_codes[8];
 static int num_devices = 0;
 static bool heater_on = false;
+/* The water temperature the thermostat judges: the same filtered value that is
+ * published on temp/<rom code>, not the single sample it came from. One
+ * DS18B20 reading wobbles by a couple of tenths, which is enough to trip a
+ * threshold a sample early or late, and at the top of a cycle that decides
+ * whether the burner runs for another minute. NAN until the sensor in the
+ * water role has been read. */
 static float last_water_temp = NAN;
 static heater_force_state_t heater_force_state = HEATER_FORCE_NONE;
 static float heater_on_threshold = 0;
@@ -787,6 +793,32 @@ static void apply_indoor_topic(const char *previous)
     }
 }
 
+/* Why the heater must not run, or NULL when there is a water temperature to
+ * judge it by. The only thing that ever turns the heater off is the water
+ * sensor reaching the off threshold, so without a reading that can be trusted
+ * there is nothing to stop it: it must neither be started nor left running.
+ * A sensor that has stopped reporting counts as no reading at all, however
+ * plausible the last value it gave was. */
+static const char *heater_no_water_reason(void)
+{
+    int i = role_index[SENSOR_ROLE_WATER];
+    if (i < 0)
+    {
+        return role_rom[SENSOR_ROLE_WATER][0] == '\0'
+                   ? "no sensor has the water role"
+                   : "the water sensor is not on the bus";
+    }
+    if (!ever_good[i] || isnan(last_water_temp))
+    {
+        return "the water sensor has not produced a reading yet";
+    }
+    if ((xTaskGetTickCount() - last_good_reading[i]) >= pdMS_TO_TICKS(TEMP_READING_TIMEOUT_MS))
+    {
+        return "the water temperature is stale";
+    }
+    return NULL;
+}
+
 /* The force-off state lives in NVS so that a heater stopped over BLE stays
  * stopped across a reboot instead of silently reverting to automatic control. */
 static void set_heater_force_state(heater_force_state_t state)
@@ -987,8 +1019,17 @@ static void process_ble_commands(void)
         }
         case BLE_CMD_HEATER_ON:
         {
+            const char *blocked = heater_no_water_reason();
+            if (blocked != NULL)
+            {
+                /* Nothing changes, not even the mode: a start that cannot be
+                 * honoured should leave the device exactly as it was. */
+                ESP_LOGW(TAG, "Refusing to start the heater: %s", blocked);
+                ble_service_report_status("heater_on", false, blocked);
+                break;
+            }
             set_heater_force_state(HEATER_FORCE_NONE);
-            if (!isnan(last_water_temp) && last_water_temp >= heater_off_threshold)
+            if (last_water_temp >= heater_off_threshold)
             {
                 heater_on = false;
                 ESP_LOGI(TAG, "Heater start requested but water temperature %.1f is above threshold", last_water_temp);
@@ -1004,11 +1045,18 @@ static void process_ble_commands(void)
         }
         case BLE_CMD_HEATER_ONCE:
         {
+            const char *blocked = heater_no_water_reason();
+            if (blocked != NULL)
+            {
+                ESP_LOGW(TAG, "Refusing to start a heating cycle: %s", blocked);
+                ble_service_report_status("heater_once", false, blocked);
+                break;
+            }
             /* Asking for one cycle when the water is already hot enough is not
              * an error, but there is no cycle to run: the stop condition is met
              * on arrival, so the mode it would have ended in is the mode it
              * starts in. */
-            if (!isnan(last_water_temp) && last_water_temp >= heater_off_threshold)
+            if (last_water_temp >= heater_off_threshold)
             {
                 set_heater_force_state(HEATER_FORCE_OFF_UNTIL_STARTED);
                 heater_on = false;
@@ -1317,8 +1365,6 @@ _Noreturn void app_main()
             meas[j][i] = 0;
     int current = 0;
     int count = 0;
-    bool has_good_temp_reading = false;
-    TickType_t last_good_temp_reading = 0;
     OneWireBus_SearchState search_state = {0};
     bool found = false;
     owb_search_first(owb, &search_state, &found);
@@ -1409,32 +1455,42 @@ _Noreturn void app_main()
                 errors[i] = ds18b20_read_temp(devices[i], &readings[i]);
             }
 
-            bool good_temp_reading = false;
+            /* Fold this sample into each sensor's history and average it,
+             * before anything acts on it: both the commands processed below and
+             * the thermostat after them judge the filtered value, so they must
+             * not be a sample behind. */
+            float filtered[MAX_DEVICES];
             for (int i = 0; i < num_devices; ++i)
             {
                 if (errors[i] == DS18B20_OK)
                 {
-                    good_temp_reading = true;
-                    break;
+                    last_good_reading[i] = xTaskGetTickCount();
+                    ever_good[i] = true;
+                    last_good_value[i] = readings[i];
+                    meas[i][current] = readings[i];
                 }
+                else
+                {
+                    ++errors_count[i];
+                    /* Repeat the previous value rather than let a dropped read
+                     * drag the average towards nothing. A sensor that keeps
+                     * failing is caught by its reading going stale, which is
+                     * what stops the heater. */
+                    meas[i][current] = meas[i][(current + AVG_COUNT - 1) % AVG_COUNT];
+                }
+                float sum = 0;
+                for (int j = 0; j < count; ++j)
+                {
+                    sum += meas[i][j];
+                }
+                filtered[i] = sum / (float)count;
+            }
+            if (role_index[SENSOR_ROLE_WATER] >= 0)
+            {
+                last_water_temp = filtered[role_index[SENSOR_ROLE_WATER]];
             }
 
             process_ble_commands();
-
-            if (good_temp_reading)
-            {
-                has_good_temp_reading = true;
-                last_good_temp_reading = xTaskGetTickCount();
-                if (role_index[SENSOR_ROLE_WATER] < 0 && role_rom[SENSOR_ROLE_WATER][0] == '\0')
-                {
-                    /* No water sensor to judge by, so there is no stop
-                     * condition to reach: a single cycle runs exactly as long
-                     * as automatic control would, which is until a mode that
-                     * forces the heater off is asked for. */
-                    heater_on = (heater_force_state == HEATER_FORCE_NONE ||
-                                 heater_force_state == HEATER_RUN_ONCE);
-                }
-            }
 
             for (int i = 0; i < num_devices; ++i)
             {
@@ -1442,10 +1498,6 @@ _Noreturn void app_main()
                 {
                     continue;
                 }
-
-                last_good_reading[i] = xTaskGetTickCount();
-                ever_good[i] = true;
-                last_good_value[i] = readings[i];
 
                 /* The shunt controller runs in its own task and only needs the
                  * two readings it regulates on. */
@@ -1464,73 +1516,78 @@ _Noreturn void app_main()
                     /* Not persisted: this is a guess from the temperature
                      * itself, which a later assignment from the app replaces. */
                     role_index[SENSOR_ROLE_WATER] = i;
+                    last_water_temp = filtered[i];
                     heater_on = false;
                     ESP_LOGI(TAG, "Sensor %d identified as water temperature; heater off at %.1f C", i, readings[i]);
                 }
-
-                if (i == role_index[SENSOR_ROLE_WATER])
-                {
-                    last_water_temp = readings[i];
-                    bool want_on = heater_on;
-                    if (heater_on && readings[i] >= heater_off_threshold)
-                    {
-                        want_on = false;
-                        ESP_LOGI(TAG, "Water temperature reached %.1f C; heater off", readings[i]);
-                    }
-                    else if (!heater_on && readings[i] <= heater_on_threshold)
-                    {
-                        want_on = true;
-                        ESP_LOGI(TAG, "Water temperature dropped to %.1f C; heater on", readings[i]);
-                    }
-
-                    if (heater_force_state == HEATER_FORCE_OFF_UNTIL_STARTED)
-                    {
-                        heater_on = false;
-                    }
-                    else if (heater_force_state == HEATER_RUN_ONCE)
-                    {
-                        /* The on threshold has no say here: the point of the
-                         * mode is to finish the cycle it was started for, and
-                         * then to stay off until somebody says otherwise. */
-                        if (readings[i] >= heater_off_threshold)
-                        {
-                            set_heater_force_state(HEATER_FORCE_OFF_UNTIL_STARTED);
-                            heater_on = false;
-                            ESP_LOGI(TAG, "Single heating cycle finished at %.1f C; off until explicitly started", readings[i]);
-                        }
-                        else
-                        {
-                            heater_on = true;
-                        }
-                    }
-                    else if (heater_force_state == HEATER_FORCE_OFF_UNTIL_CONDITIONS)
-                    {
-                        if (want_on)
-                        {
-                            set_heater_force_state(HEATER_FORCE_NONE);
-                            heater_on = true;
-                            ESP_LOGI(TAG, "Start conditions met again; resuming automatic heater control");
-                        }
-                        else
-                        {
-                            heater_on = false;
-                        }
-                    }
-                    else
-                    {
-                        heater_on = want_on;
-                    }
-                }
             }
 
-            if (!has_good_temp_reading ||
-                (xTaskGetTickCount() - last_good_temp_reading) >= pdMS_TO_TICKS(TEMP_READING_TIMEOUT_MS))
+            /* The thermostat. It runs once per sample rather than per sensor,
+             * and on the filtered water temperature, so a sample the water
+             * sensor failed to produce no longer skips the decision - it ages
+             * the reading out instead, and that turns the heater off. */
+            const char *no_water = heater_no_water_reason();
+            if (no_water != NULL)
             {
                 if (heater_on)
                 {
-                    ESP_LOGW(TAG, "No valid temperature reading for %d seconds; heater off", TEMP_READING_TIMEOUT_MS / 1000);
+                    ESP_LOGW(TAG, "Heater off: %s", no_water);
                 }
+                /* Only the output; the mode is left alone, so a single cycle
+                 * interrupted by a dead sensor resumes when it comes back. */
                 heater_on = false;
+            }
+            else
+            {
+                bool want_on = heater_on;
+                if (heater_on && last_water_temp >= heater_off_threshold)
+                {
+                    want_on = false;
+                    ESP_LOGI(TAG, "Water temperature reached %.1f C; heater off", last_water_temp);
+                }
+                else if (!heater_on && last_water_temp <= heater_on_threshold)
+                {
+                    want_on = true;
+                    ESP_LOGI(TAG, "Water temperature dropped to %.1f C; heater on", last_water_temp);
+                }
+
+                if (heater_force_state == HEATER_FORCE_OFF_UNTIL_STARTED)
+                {
+                    heater_on = false;
+                }
+                else if (heater_force_state == HEATER_RUN_ONCE)
+                {
+                    /* The on threshold has no say here: the point of the mode
+                     * is to finish the cycle it was started for, and then to
+                     * stay off until somebody says otherwise. */
+                    if (last_water_temp >= heater_off_threshold)
+                    {
+                        set_heater_force_state(HEATER_FORCE_OFF_UNTIL_STARTED);
+                        heater_on = false;
+                        ESP_LOGI(TAG, "Single heating cycle finished at %.1f C; off until explicitly started", last_water_temp);
+                    }
+                    else
+                    {
+                        heater_on = true;
+                    }
+                }
+                else if (heater_force_state == HEATER_FORCE_OFF_UNTIL_CONDITIONS)
+                {
+                    if (want_on)
+                    {
+                        set_heater_force_state(HEATER_FORCE_NONE);
+                        heater_on = true;
+                        ESP_LOGI(TAG, "Start conditions met again; resuming automatic heater control");
+                    }
+                    else
+                    {
+                        heater_on = false;
+                    }
+                }
+                else
+                {
+                    heater_on = want_on;
+                }
             }
             gpio_set_level(GPIO_HEATER, heater_on);
 
@@ -1544,35 +1601,21 @@ _Noreturn void app_main()
             for (int i = 0; i < num_devices; ++i)
             {
                 char rom_code_s[17];
-                bool publish_error = false;
                 owb_string_from_rom_code(devices[i]->rom_code, rom_code_s, sizeof(rom_code_s));
 
-                if (errors[i] != DS18B20_OK)
-                {
-                    ++errors_count[i];
-                    meas[i][current] = meas[i][(current + AVG_COUNT - 1) % AVG_COUNT];
-                    publish_error = true;
-                }
-                else
-                {
-                    meas[i][current] = readings[i];
-                }
                 char buf[10];
                 char topic[100];
                 printf("  %s: %.1f    %d errors\n", rom_code_s, readings[i], errors_count[i]);
-                float sum = 0;
-                for (int j = 0; j < 10 && j < count; ++j)
-                    sum += meas[i][j];
                 if (sample_count % AVG_COUNT == 0)
                 {
-                    int len = snprintf(buf, 10, "%.2f", sum / (float)count);
+                    int len = snprintf(buf, 10, "%.2f", filtered[i]);
                     snprintf(topic, 100, "temp/%s", rom_code_s);
                     if (len > 0)
                     {
                         mqtt_publish(topic, buf, len);
                     }
                 }
-                if (publish_error)
+                if (errors[i] != DS18B20_OK)
                 {
                     int len = snprintf(buf, 10, "%d", errors_count[i]);
                     snprintf(topic, 100, "temp/errors/%s", rom_code_s);
@@ -1601,9 +1644,9 @@ _Noreturn void app_main()
     {
         process_ble_commands();
 
-        /* Same interlock the sampling loop applies when readings go stale:
-         * with no temperature to judge by, the heater must never run, so a
-         * heater_on command is accepted and then immediately overridden. */
+        /* A start command is already refused here, since no sensor can hold the
+         * water role when none was found; this is the same backstop the
+         * sampling loop keeps, in case the output was left on some other way. */
         if (heater_on)
         {
             ESP_LOGW(TAG, "No temperature sensors; refusing to run the heater");

@@ -25,7 +25,10 @@ Bluetooth Low Energy, shows live telemetry, and sends the same set of commands.
   stops at the off threshold and then stays off until it is started again,
   force it off (either until the start conditions are met again or until
   explicitly started), change the thresholds, say what each sensor is for, set
-  the Wi-Fi credentials, and point the device at a different MQTT broker.
+  the Wi-Fi credentials, and point the device at a different MQTT broker. The
+  two buttons that start the heater are disabled unless a sensor in the water
+  role has reported recently, because that reading is the only thing that ever
+  stops it.
 * **Adjusts the heating curve.** The slope and parallel offset that turn the
   outdoor temperature into a supply temperature, the indoor target the curve
   pivots about, and the supply limits — the same dials as the panel this

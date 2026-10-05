@@ -86,7 +86,17 @@ templogctl heater-off                 # resumes automatically once temp drops to
 templogctl heater-off --until-started # stays off until an explicit heater-on
 templogctl heater-on                  # starts heater unless water temp already >= off-threshold
 templogctl heater-once                # heats once up to the off-threshold, then stays off until heater-on
+```
 
+Both start commands are refused, with the reason in the status reply, unless a
+sensor in the `water` role has produced a reading in the last 60 seconds. That
+reading is the only thing that ever turns the heater off, so without one there
+would be nothing to stop it; for the same reason a water temperature that goes
+stale while the heater is running turns it off. The thresholds are compared
+against the filtered value published on `temp/<rom code>`, a ten-sample
+average, rather than a single sample, which wobbles by a couple of tenths.
+
+```sh
 templogctl set-curve --slope 1.2 --offset -1 --target 21 --min 20 --max 70
 templogctl set-shunt --on --burst 1000 --pause 10 --tolerance 1.0
 templogctl set-shunt --off             # stop driving the valve, leaving it where it is

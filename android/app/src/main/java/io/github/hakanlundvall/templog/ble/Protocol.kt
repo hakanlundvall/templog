@@ -40,6 +40,12 @@ object Protocol {
     /** Client Characteristic Configuration descriptor, used to subscribe. */
     val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
+    /**
+     * How old a reading may be before the device stops trusting it, mirroring
+     * TEMP_READING_TIMEOUT_MS in the firmware.
+     */
+    const val WATER_TEMP_TIMEOUT_MS = 60_000L
+
     const val CMD_SET_WIFI = "set_wifi"
     const val CMD_SET_MQTT = "set_mqtt"
     const val CMD_SET_SENSOR_ROLE = "set_sensor_role"
@@ -422,6 +428,18 @@ data class Telemetry(
 ) {
     val waterSensor: SensorReading?
         get() = sensors.firstOrNull { it.role == SensorRole.WATER }
+
+    /**
+     * Whether there is a water temperature for the thermostat to judge. The
+     * only thing that ever turns the heater off is the water sensor reaching
+     * the off threshold, so the device refuses to start without a reading it
+     * can trust, and a sensor that has stopped reporting counts as none. The
+     * buttons that would start it are disabled to match.
+     */
+    val hasWaterTemperature: Boolean
+        get() = waterSensor?.let {
+            it.celsius != null && (it.ageMs ?: Long.MAX_VALUE) < Protocol.WATER_TEMP_TIMEOUT_MS
+        } == true
 
     companion object {
         fun parse(json: String): Telemetry {

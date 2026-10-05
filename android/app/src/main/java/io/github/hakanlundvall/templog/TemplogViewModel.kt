@@ -118,6 +118,8 @@ class TemplogViewModel(application: Application) : AndroidViewModel(application)
 
     fun heaterOn() = issue("Heater started", Protocol.heaterOn())
 
+    fun heaterOnce() = issue("Heating once, then off until started", Protocol.heaterOnce())
+
     fun checkForFirmwareUpdate() {
         if (_releaseCheck.value == ReleaseCheck.Checking) return
         _releaseCheck.value = ReleaseCheck.Checking

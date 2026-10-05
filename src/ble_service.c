@@ -309,6 +309,8 @@ static void handle_command_json(const char *json, size_t len)
         }
     } else if (strcmp(cmd, "heater_on") == 0) {
         out.type = BLE_CMD_HEATER_ON;
+    } else if (strcmp(cmd, "heater_once") == 0) {
+        out.type = BLE_CMD_HEATER_ONCE;
     } else if (strcmp(cmd, "ota_ble_begin") == 0) {
         const cJSON *size = cJSON_GetObjectItemCaseSensitive(root, "size");
         const cJSON *crc = cJSON_GetObjectItemCaseSensitive(root, "crc32");

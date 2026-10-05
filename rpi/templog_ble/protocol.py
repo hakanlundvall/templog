@@ -46,6 +46,7 @@ CMD_SET_WATER_SENSOR = "set_water_sensor"
 CMD_SET_THRESHOLDS = "set_thresholds"
 CMD_HEATER_OFF = "heater_off"
 CMD_HEATER_ON = "heater_on"
+CMD_HEATER_ONCE = "heater_once"
 CMD_OTA_UPDATE = "ota_update"
 CMD_SET_SHUNT = "set_shunt"
 CMD_SHUNT_JOG = "shunt_jog"
@@ -63,3 +64,17 @@ JOG_COLDER = "colder"
 
 HEATER_OFF_UNTIL_CONDITIONS = "until_conditions"
 HEATER_OFF_UNTIL_STARTED = "until_started"
+
+# "forceState" in the telemetry, and the name the device publishes on
+# temp/1/heater/mode. HEAT_ONCE is a single cycle that becomes
+# OFF_UNTIL_STARTED by itself once the water reaches the off threshold.
+HEATER_MODE_AUTO = 0
+HEATER_MODE_OFF_UNTIL_CONDITIONS = 1
+HEATER_MODE_OFF_UNTIL_STARTED = 2
+HEATER_MODE_HEAT_ONCE = 3
+HEATER_MODE_NAMES = {
+    HEATER_MODE_AUTO: "auto",
+    HEATER_MODE_OFF_UNTIL_CONDITIONS: "off_until_conditions",
+    HEATER_MODE_OFF_UNTIL_STARTED: "off_until_started",
+    HEATER_MODE_HEAT_ONCE: "heat_once",
+}

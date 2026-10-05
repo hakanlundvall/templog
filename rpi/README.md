@@ -16,7 +16,8 @@ over Bluetooth Low Energy (BLE), robust against flaky BLE connectivity.
     actuator and the indoor topic, plus the running firmware version,
   * a **command** characteristic (write) — set Wi-Fi, set the MQTT broker,
     give a sensor a role, set heater thresholds, force heater off, start
-    heater, adjust the heating curve and drive the shunt valve,
+    heater, run a single heating cycle, adjust the heating curve and drive
+    the shunt valve,
   * a **status** characteristic (read + notify) — result of the last command.
 * The link is encrypted and bonded (NimBLE "Just Works" pairing + LE Secure
   Connections). Bonds are stored in the ESP32's flash (NVS), so re-pairing is
@@ -84,6 +85,7 @@ templogctl set-thresholds --on 60 --off 80
 templogctl heater-off                 # resumes automatically once temp drops to/below the on-threshold
 templogctl heater-off --until-started # stays off until an explicit heater-on
 templogctl heater-on                  # starts heater unless water temp already >= off-threshold
+templogctl heater-once                # heats once up to the off-threshold, then stays off until heater-on
 
 templogctl set-curve --slope 1.2 --offset -1 --target 21 --min 20 --max 70
 templogctl set-shunt --on --burst 1000 --pause 10 --tolerance 1.0
@@ -144,8 +146,9 @@ sensors on the bus. `templog-ble` reads all three and merges them, so
 `age` is milliseconds since that sensor's last good reading; a missing `c`/`age`
 means the sensor has never produced a valid reading. `onC`/`offC` are the
 current heater thresholds and `forceState` is `0` (automatic), `1` (forced
-off until start conditions are met again) or `2` (forced off until
-explicitly started).
+off until start conditions are met again), `2` (forced off until explicitly
+started) or `3` (finishing one heating cycle, after which the device sets
+itself to `2`).
 
 Firmware can also be pushed straight to the device over BLE by the Android
 app, for a device whose Wi-Fi is not working; `templogctl` only triggers the

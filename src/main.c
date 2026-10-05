@@ -65,6 +65,11 @@ typedef enum {
     HEATER_FORCE_NONE = 0,
     HEATER_FORCE_OFF_UNTIL_CONDITIONS,
     HEATER_FORCE_OFF_UNTIL_STARTED,
+    /* One heating cycle and no more: the heater runs without regard to the on
+     * threshold until the water reaches the off threshold, and then the mode
+     * becomes HEATER_FORCE_OFF_UNTIL_STARTED, so nothing restarts it but an
+     * explicit command. */
+    HEATER_RUN_ONCE,
 } heater_force_state_t;
 
 /* What each DS18B20 is used for. The water sensor drives the heater
@@ -521,6 +526,8 @@ static const char *heater_mode_name(heater_force_state_t state)
         return "off_until_conditions";
     case HEATER_FORCE_OFF_UNTIL_STARTED:
         return "off_until_started";
+    case HEATER_RUN_ONCE:
+        return "heat_once";
     case HEATER_FORCE_NONE:
     default:
         return "auto";
@@ -995,6 +1002,29 @@ static void process_ble_commands(void)
             ble_service_report_status("heater_on", true, NULL);
             break;
         }
+        case BLE_CMD_HEATER_ONCE:
+        {
+            /* Asking for one cycle when the water is already hot enough is not
+             * an error, but there is no cycle to run: the stop condition is met
+             * on arrival, so the mode it would have ended in is the mode it
+             * starts in. */
+            if (!isnan(last_water_temp) && last_water_temp >= heater_off_threshold)
+            {
+                set_heater_force_state(HEATER_FORCE_OFF_UNTIL_STARTED);
+                heater_on = false;
+                ESP_LOGI(TAG, "Single heating cycle requested but water temperature %.1f is already at the stop condition",
+                         last_water_temp);
+            }
+            else
+            {
+                set_heater_force_state(HEATER_RUN_ONCE);
+                heater_on = true;
+                ESP_LOGI(TAG, "Single heating cycle started; will stop at %.1f C", heater_off_threshold);
+            }
+            gpio_set_level(GPIO_HEATER, heater_on);
+            ble_service_report_status("heater_once", true, NULL);
+            break;
+        }
         case BLE_CMD_OTA_UPDATE:
         {
             const char *error = NULL;
@@ -1248,11 +1278,11 @@ _Noreturn void app_main()
         printf("Heater thresholds: on=%.1f off=%.1f\n", heater_on_threshold, heater_off_threshold);
 
         uint8_t force = HEATER_FORCE_NONE;
-        if (nvs_get_u8(my_handle, "heatForce", &force) == ESP_OK && force <= HEATER_FORCE_OFF_UNTIL_STARTED)
+        if (nvs_get_u8(my_handle, "heatForce", &force) == ESP_OK && force <= HEATER_RUN_ONCE)
         {
             heater_force_state = (heater_force_state_t)force;
         }
-        printf("Heater force state: %d\n", (int)heater_force_state);
+        printf("Heater force state: %s\n", heater_mode_name(heater_force_state));
     }
 
     shunt_init(g_nvs_handle);
@@ -1397,7 +1427,12 @@ _Noreturn void app_main()
                 last_good_temp_reading = xTaskGetTickCount();
                 if (role_index[SENSOR_ROLE_WATER] < 0 && role_rom[SENSOR_ROLE_WATER][0] == '\0')
                 {
-                    heater_on = (heater_force_state == HEATER_FORCE_NONE);
+                    /* No water sensor to judge by, so there is no stop
+                     * condition to reach: a single cycle runs exactly as long
+                     * as automatic control would, which is until a mode that
+                     * forces the heater off is asked for. */
+                    heater_on = (heater_force_state == HEATER_FORCE_NONE ||
+                                 heater_force_state == HEATER_RUN_ONCE);
                 }
             }
 
@@ -1451,6 +1486,22 @@ _Noreturn void app_main()
                     if (heater_force_state == HEATER_FORCE_OFF_UNTIL_STARTED)
                     {
                         heater_on = false;
+                    }
+                    else if (heater_force_state == HEATER_RUN_ONCE)
+                    {
+                        /* The on threshold has no say here: the point of the
+                         * mode is to finish the cycle it was started for, and
+                         * then to stay off until somebody says otherwise. */
+                        if (readings[i] >= heater_off_threshold)
+                        {
+                            set_heater_force_state(HEATER_FORCE_OFF_UNTIL_STARTED);
+                            heater_on = false;
+                            ESP_LOGI(TAG, "Single heating cycle finished at %.1f C; off until explicitly started", readings[i]);
+                        }
+                        else
+                        {
+                            heater_on = true;
+                        }
                     }
                     else if (heater_force_state == HEATER_FORCE_OFF_UNTIL_CONDITIONS)
                     {

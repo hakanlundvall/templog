@@ -44,7 +44,9 @@ typedef struct {
     bool heater_on;
     float heater_on_threshold_c;
     float heater_off_threshold_c;
-    /* 0 = automatic, 1 = forced off until conditions met again, 2 = forced off until explicitly started */
+    /* 0 = automatic, 1 = forced off until conditions met again, 2 = forced off
+     * until explicitly started, 3 = finishing one heating cycle, after which it
+     * becomes 2. */
     int heater_force_state;
     /* Shunt valve control: the curve settings, the actuator, and where the
      * loop currently stands. */
@@ -90,6 +92,7 @@ typedef enum {
     BLE_CMD_SET_THRESHOLDS,
     BLE_CMD_HEATER_FORCE_OFF,
     BLE_CMD_HEATER_ON,
+    BLE_CMD_HEATER_ONCE,
     BLE_CMD_OTA_UPDATE,
     BLE_CMD_OTA_BLE_BEGIN,
     BLE_CMD_OTA_BLE_END,

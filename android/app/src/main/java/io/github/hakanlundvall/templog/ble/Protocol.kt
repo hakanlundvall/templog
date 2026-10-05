@@ -46,6 +46,7 @@ object Protocol {
     const val CMD_SET_THRESHOLDS = "set_thresholds"
     const val CMD_HEATER_OFF = "heater_off"
     const val CMD_HEATER_ON = "heater_on"
+    const val CMD_HEATER_ONCE = "heater_once"
     const val CMD_OTA_UPDATE = "ota_update"
     const val CMD_OTA_BLE_BEGIN = "ota_ble_begin"
     const val CMD_OTA_BLE_END = "ota_ble_end"
@@ -152,6 +153,14 @@ object Protocol {
             .put("mode", if (untilStarted) HEATER_OFF_UNTIL_STARTED else HEATER_OFF_UNTIL_CONDITIONS)
 
     fun heaterOn(): JSONObject = JSONObject().put("cmd", CMD_HEATER_ON)
+
+    /**
+     * Asks for one heating cycle: the heater runs until the water reaches the
+     * off threshold, and the device then puts itself in
+     * [HeaterForceState.OFF_UNTIL_STARTED]. If the water is already at the off
+     * threshold there is no cycle to run, and the device goes straight there.
+     */
+    fun heaterOnce(): JSONObject = JSONObject().put("cmd", CMD_HEATER_ONCE)
 
     /**
      * Asks the device to download and install the firmware.bin of the GitHub
@@ -335,6 +344,12 @@ enum class HeaterForceState {
     /** 2 - forced off until an explicit heater_on command. */
     OFF_UNTIL_STARTED,
 
+    /**
+     * 3 - finishing a single heating cycle, ignoring the on threshold, after
+     * which the device moves itself to [OFF_UNTIL_STARTED].
+     */
+    HEAT_ONCE,
+
     /** Anything the firmware may add later. */
     UNKNOWN,
     ;
@@ -344,6 +359,7 @@ enum class HeaterForceState {
             0 -> AUTOMATIC
             1 -> OFF_UNTIL_CONDITIONS
             2 -> OFF_UNTIL_STARTED
+            3 -> HEAT_ONCE
             else -> UNKNOWN
         }
     }

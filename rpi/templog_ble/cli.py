@@ -122,6 +122,10 @@ def cmd_heater_on(args: argparse.Namespace) -> None:
     _issue_command(args, {"cmd": protocol.CMD_HEATER_ON})
 
 
+def cmd_heater_once(args: argparse.Namespace) -> None:
+    _issue_command(args, {"cmd": protocol.CMD_HEATER_ONCE})
+
+
 def cmd_ota_update(args: argparse.Namespace) -> None:
     _issue_command(args, {"cmd": protocol.CMD_OTA_UPDATE, "tag": args.tag, "force": args.force})
 
@@ -213,6 +217,12 @@ def main() -> None:
 
     p = sub.add_parser("heater-on", help="Start the heater (unless water temperature is already above the off threshold)")
     p.set_defaults(func=cmd_heater_on)
+
+    p = sub.add_parser(
+        "heater-once",
+        help="Run one heating cycle: heat until the off threshold is reached, then stay off until an explicit 'heater-on'",
+    )
+    p.set_defaults(func=cmd_heater_once)
 
     p = sub.add_parser("ota-update", help="Have the ESP32 download and install a firmware release from GitHub")
     p.add_argument("--tag", default="latest", help="Release tag to install, e.g. v1.2.0 (default: latest)")

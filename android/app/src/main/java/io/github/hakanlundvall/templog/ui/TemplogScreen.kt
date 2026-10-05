@@ -141,6 +141,7 @@ fun TemplogScreen(
                             telemetry = snapshot,
                             enabled = state == ConnectionState.READY && !busy,
                             onHeaterOn = viewModel::heaterOn,
+                            onHeaterOnce = viewModel::heaterOnce,
                             onHeaterOff = viewModel::heaterOff,
                             onEditThresholds = { dialog = Dialog.Thresholds },
                         )
@@ -363,6 +364,7 @@ private fun HeaterCard(
     telemetry: Telemetry,
     enabled: Boolean,
     onHeaterOn: () -> Unit,
+    onHeaterOnce: () -> Unit,
     onHeaterOff: (Boolean) -> Unit,
     onEditThresholds: () -> Unit,
 ) {
@@ -406,6 +408,9 @@ private fun HeaterCard(
                         "Mode: forced off, resumes once the start conditions are met again"
                     HeaterForceState.OFF_UNTIL_STARTED ->
                         "Mode: forced off until explicitly started"
+                    HeaterForceState.HEAT_ONCE ->
+                        "Mode: heating once to ${telemetry.heaterOffThresholdC.formatC()}, " +
+                            "then off until explicitly started"
                     HeaterForceState.UNKNOWN -> "Mode: unknown"
                 },
                 style = MaterialTheme.typography.bodyMedium,
@@ -425,6 +430,11 @@ private fun HeaterCard(
                     modifier = Modifier.weight(1f),
                 ) { Text("Off") }
             }
+            OutlinedButton(
+                onClick = onHeaterOnce,
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Heat once, then off until started") }
             OutlinedButton(
                 onClick = { onHeaterOff(true) },
                 enabled = enabled,

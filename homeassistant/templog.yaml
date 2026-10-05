@@ -1,0 +1,188 @@
+# Home Assistant entities for the topics the templog firmware publishes.
+#
+# Installed as a package; see README.md in this directory. Everything here is
+# derived from src/main.c - if a topic changes there, it changes here, which is
+# why this file lives in the firmware's repository rather than only in the Home
+# Assistant configuration directory.
+#
+# The three DS18B20 temperatures are deliberately absent. They already exist as
+# sensor.panna_temperatur, sensor.framledning_temperatur and
+# sensor.utomhus_temperatur, created by the "Uppstart MQTT Config" automation
+# publishing MQTT discovery configs whose unique_ids are the bare ROM codes.
+# Defining them again here would collide on those unique_ids and risk orphaning
+# their history.
+
+mqtt:
+  binary_sensor:
+    # The device's own connection state, and the only entity here without an
+    # availability topic of its own - it is the availability topic.
+    #
+    # The firmware publishes "start" on connect and leaves "disconnected" as
+    # its last will, both retained, so a subscriber that arrives after the
+    # device dropped off still learns that it is gone.
+    - name: "Online"
+      unique_id: templog_online
+      state_topic: "temp/1/status"
+      payload_on: "start"
+      payload_off: "disconnected"
+      device_class: connectivity
+      entity_category: diagnostic
+      device: &templog_device
+        identifiers: [templog]
+        name: templog
+        manufacturer: hakanlundvall
+        model: ESP32 heater controller
+
+    - name: "Heater"
+      unique_id: templog_heater
+      state_topic: "temp/1/heater"
+      payload_on: "on"
+      payload_off: "off"
+      device_class: running
+      availability_topic: &templog_availability "temp/1/status"
+      payload_available: &templog_available "start"
+      payload_not_available: &templog_not_available "disconnected"
+      device: *templog_device
+
+  select:
+    # The mode, read and written with the same four names, so whatever appears
+    # on the state topic can be written straight back to the command topic.
+    #
+    # heat_once has to be listed even though the card also carries a button for
+    # it: it is a real persisted mode that the device reports here, and a select
+    # whose incoming state is not one of its options rejects the update and logs
+    # an error.
+    #
+    # retain MUST stay false. The firmware ignores a retained message on the
+    # command topic on purpose, because this broker would replay it on every
+    # reconnect and heat_once would start a fresh cycle each time the link
+    # bounced.
+    - name: "Heater mode"
+      unique_id: templog_heater_mode
+      state_topic: "temp/1/heater/mode"
+      command_topic: "temp/1/heater/mode/set"
+      options:
+        - "auto"
+        - "off_until_conditions"
+        - "off_until_started"
+        - "heat_once"
+      retain: false
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device
+
+  button:
+    # One heating cycle: the heater runs to the off threshold and the device
+    # then puts itself in off_until_started, so nothing restarts it until a mode
+    # that starts it is asked for. Refused, leaving the mode untouched, if there
+    # is no fresh water temperature to end the cycle by.
+    - name: "Heat once"
+      unique_id: templog_heat_once
+      command_topic: "temp/1/heater/mode/set"
+      payload_press: "heat_once"
+      retain: false
+      icon: mdi:water-boiler
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device
+
+  sensor:
+    # What the thermostat is aiming for. Reported only - the thresholds are
+    # changed over BLE, where they can be checked against each other.
+    - name: "Heater on threshold"
+      unique_id: templog_heater_on_c
+      state_topic: "temp/1/heater/on_c"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device
+
+    - name: "Heater off threshold"
+      unique_id: templog_heater_off_c
+      state_topic: "temp/1/heater/off_c"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device
+
+    # The shunt valve controller. "holding" means an input it regulates on is
+    # missing or stale and the valve is being left where it is.
+    - name: "Shunt state"
+      unique_id: templog_shunt_state
+      state_topic: "temp/1/shunt/state"
+      icon: mdi:valve
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device
+
+    # The supply temperature the heating curve asks for, which is worth
+    # graphing against sensor.framledning_temperatur - the one it is chasing.
+    - name: "Shunt setpoint"
+      unique_id: templog_shunt_setpoint
+      state_topic: "temp/1/shunt/setpoint"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device
+
+    # Corrections made in a row in one direction, positive towards warmer. A
+    # count that keeps climbing is a valve against an end stop, or a boiler
+    # that cannot deliver.
+    - name: "Shunt bursts"
+      unique_id: templog_shunt_bursts
+      state_topic: "temp/1/shunt/bursts"
+      state_class: measurement
+      icon: mdi:counter
+      entity_category: diagnostic
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device
+
+    # Failed reads per sensor since boot, by ROM code. Named after the role
+    # each one holds rather than its code, which is how the firmware's own
+    # telemetry presents them.
+    - name: "Read errors water"
+      unique_id: templog_errors_water
+      state_topic: "temp/errors/196a88491f64ff28"
+      state_class: total_increasing
+      icon: mdi:alert-circle-outline
+      entity_category: diagnostic
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device
+
+    - name: "Read errors supply"
+      unique_id: templog_errors_supply
+      state_topic: "temp/errors/1774a4491f64ff28"
+      state_class: total_increasing
+      icon: mdi:alert-circle-outline
+      entity_category: diagnostic
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device
+
+    - name: "Read errors outdoor"
+      unique_id: templog_errors_outdoor
+      state_topic: "temp/errors/f4eda3491f64ff28"
+      state_class: total_increasing
+      icon: mdi:alert-circle-outline
+      entity_category: diagnostic
+      availability_topic: *templog_availability
+      payload_available: *templog_available
+      payload_not_available: *templog_not_available
+      device: *templog_device

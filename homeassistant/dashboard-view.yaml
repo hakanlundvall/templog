@@ -1,0 +1,134 @@
+# A dashboard view for templog, to be pasted into the `views:` list of the
+# default dashboard's raw configuration editor (dashboard -> pencil ->
+# three-dot menu -> "Raw configuration editor"). The dashboards on this setup
+# are in UI/storage mode, so this cannot be installed as a file.
+#
+# The temperatures come from the sensors the "Uppstart MQTT Config" automation
+# already creates; everything else comes from templog.yaml in this directory.
+
+- title: Värmepanna
+  path: templog
+  icon: mdi:water-boiler
+  type: sections
+  max_columns: 3
+  sections:
+    - type: grid
+      cards:
+        - type: heading
+          heading: Varmvatten
+          icon: mdi:water-boiler
+
+        - type: tile
+          entity: sensor.panna_temperatur
+          name: Pannan
+
+        - type: tile
+          entity: binary_sensor.templog_heater
+          name: Värmare
+
+        # The dropdown sits on the tile itself, so the mode can be read and
+        # changed in one place. heat_once appears here as well as on the button
+        # below, because the device reports it on the state topic and a select
+        # rejects a state that is not one of its options.
+        - type: tile
+          entity: select.templog_heater_mode
+          name: Läge
+          features:
+            - type: select-options
+
+        # Tapping this publishes heat_once: one cycle up to the off threshold,
+        # after which the device puts itself in off_until_started. It genuinely
+        # fires the boiler.
+        - type: tile
+          entity: button.templog_heat_once
+          name: Värm en gång
+          tap_action:
+            action: toggle
+
+        - type: tile
+          entity: sensor.templog_heater_on_threshold
+          name: Startar vid
+        - type: tile
+          entity: sensor.templog_heater_off_threshold
+          name: Stannar vid
+
+    - type: grid
+      cards:
+        - type: heading
+          heading: Shuntventil
+          icon: mdi:valve
+
+        - type: tile
+          entity: sensor.templog_shunt_state
+          name: Läge
+
+        # What the heating curve asks for, next to the temperature it is
+        # chasing - the pair is the whole story of the shunt loop.
+        - type: tile
+          entity: sensor.templog_shunt_setpoint
+          name: Begärd framledning
+        - type: tile
+          entity: sensor.framledning_temperatur
+          name: Uppmätt framledning
+
+        - type: tile
+          entity: sensor.utomhus_temperatur
+          name: Utomhus
+
+    - type: grid
+      cards:
+        - type: heading
+          heading: Diagnostik
+          icon: mdi:stethoscope
+
+        - type: tile
+          entity: binary_sensor.templog_online
+          name: Anslutning
+
+        # A burst count that keeps climbing is a valve against an end stop, or
+        # a boiler that cannot deliver.
+        - type: tile
+          entity: sensor.templog_shunt_bursts
+          name: Korrigeringar i rad
+
+        - type: tile
+          entity: sensor.templog_read_errors_water
+          name: Lässfel pannan
+        - type: tile
+          entity: sensor.templog_read_errors_supply
+          name: Lässfel framledning
+        - type: tile
+          entity: sensor.templog_read_errors_outdoor
+          name: Lässfel utomhus
+
+    # Full width at the bottom: the burner cycling against the water
+    # temperature it is driving, and the shunt loop chasing its setpoint.
+    - type: grid
+      column_span: 3
+      cards:
+        - type: heading
+          heading: Historik
+
+        - type: history-graph
+          hours_to_show: 24
+          title: Varmvatten
+          entities:
+            - entity: sensor.panna_temperatur
+              name: Pannan
+            - entity: sensor.templog_heater_on_threshold
+              name: Startar vid
+            - entity: sensor.templog_heater_off_threshold
+              name: Stannar vid
+            - entity: binary_sensor.templog_heater
+              name: Värmare
+
+        - type: history-graph
+          hours_to_show: 24
+          title: Shunt
+          entities:
+            - entity: sensor.templog_shunt_setpoint
+              name: Begärd
+            - entity: sensor.framledning_temperatur
+              name: Uppmätt
+            - entity: sensor.utomhus_temperatur
+              name: Utomhus

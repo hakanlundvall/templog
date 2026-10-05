@@ -90,3 +90,9 @@ HEATER_MODE_NAMES = {
 # on the command topic for that reason.
 HEATER_MODE_STATE_TOPIC = "temp/1/heater/mode"
 HEATER_MODE_COMMAND_TOPIC = "temp/1/heater/mode/set"
+
+# The thresholds, published retained alongside the mode. Reported only: they are
+# changed with CMD_SET_THRESHOLDS over BLE, where the two are checked against
+# each other.
+HEATER_ON_THRESHOLD_TOPIC = "temp/1/heater/on_c"
+HEATER_OFF_THRESHOLD_TOPIC = "temp/1/heater/off_c"

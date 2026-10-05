@@ -216,7 +216,14 @@ or supply reading is missing or more than two minutes old; `state` is then
 `holding` and `why` says which.
 
 The controller also mirrors itself onto MQTT as retained messages:
-`temp/1/shunt/state`, `temp/1/shunt/setpoint` and `temp/1/shunt/bursts`.
+`temp/1/shunt/state`, `temp/1/shunt/setpoint` and `temp/1/shunt/bursts`. The
+heater does the same on `temp/1/heater`, `temp/1/heater/mode` and the two
+thresholds `temp/1/heater/on_c` and `temp/1/heater/off_c`, and reports its own
+connection on `temp/1/status` — `start` on connect, `disconnected` as a retained
+last will, which together make that topic usable as an availability topic.
+
+[`../homeassistant`](../homeassistant) turns all of it into Home Assistant
+entities, including a dropdown that writes the mode command topic.
 
 ## Switching the heater mode over MQTT
 

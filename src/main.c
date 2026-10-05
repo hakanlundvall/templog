@@ -316,6 +316,10 @@ void wifi_init_sta(void)
  * reported. The payload is one of the names below, so whatever is read off the
  * state topic can be written straight back to this one. */
 #define HEATER_MODE_SET_TOPIC "temp/1/heater/mode/set"
+/* The thresholds the thermostat switches on. Reported only; they are changed
+ * over BLE, where they can be checked against each other. */
+#define HEATER_ON_TOPIC "temp/1/heater/on_c"
+#define HEATER_OFF_TOPIC "temp/1/heater/off_c"
 
 static const char *heater_mode_name(heater_force_state_t state)
 {
@@ -548,7 +552,12 @@ static bool mqtt_make_config(esp_mqtt_client_config_t *cfg, const char **error)
         .session.last_will.msg_len = sizeof(lwt_msg) - 1,
         .session.last_will.qos = 1,
         .session.last_will.topic = mqtt_status_topic,
-        .session.last_will.retain = 0,
+        /* Retained, so a subscriber that connects after the device dropped off
+         * still learns it is gone, rather than waiting for a message that will
+         * not come until the device is back. The birth message below is
+         * retained for the same reason, and the pair is what lets Home
+         * Assistant treat this topic as an availability topic. */
+        .session.last_will.retain = 1,
         .session.keepalive = 9,
     };
 
@@ -591,7 +600,7 @@ static esp_mqtt_client_handle_t mqtt_app_start(const char **error)
     /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
-    esp_mqtt_client_publish(client, mqtt_status_topic, connect_msg, sizeof(connect_msg) - 1, 1, 0);
+    esp_mqtt_client_publish(client, mqtt_status_topic, connect_msg, sizeof(connect_msg) - 1, 1, 1);
 
     g_mqtt_client = client;
     return client;
@@ -610,16 +619,29 @@ static void mqtt_publish(const char *topic, const char *payload, int len)
     ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
 }
 
-/* Publishes the heater output and mode as retained messages whenever either
- * changes, and again after each broker reconnect, so a subscriber such as
- * Home Assistant always sees the current state. Nothing is sent while the
- * broker is unreachable; the pending change goes out once it is back. */
+/* Publishes the heater output, its mode and the two thresholds it switches on
+ * as retained messages whenever any of them changes, and again after each
+ * broker reconnect, so a subscriber such as Home Assistant always sees the
+ * current state. The thresholds are here rather than with the readings because
+ * they move only on command, and a subscriber that can see them can say what
+ * the heater is aiming for and not just whether it is running.
+ *
+ * Nothing is sent while the broker is unreachable; the pending change goes out
+ * once it is back. */
 static void publish_heater_state(void)
 {
     static bool last_on = false;
     static heater_force_state_t last_mode = HEATER_FORCE_NONE;
+    /* Compared in tenths, which is the resolution they are published at, so a
+     * float that is merely a rounding apart does not count as a change. */
+    static int last_on_decic = INT32_MIN;
+    static int last_off_decic = INT32_MIN;
 
-    if (heater_on != last_on || heater_force_state != last_mode)
+    int on_decic = (int)lroundf(heater_on_threshold * 10.0f);
+    int off_decic = (int)lroundf(heater_off_threshold * 10.0f);
+
+    if (heater_on != last_on || heater_force_state != last_mode ||
+        on_decic != last_on_decic || off_decic != last_off_decic)
     {
         s_heater_state_dirty = true;
     }
@@ -631,15 +653,27 @@ static void publish_heater_state(void)
 
     const char *state = heater_on ? "on" : "off";
     const char *mode = heater_mode_name(heater_force_state);
+    char on_buf[10];
+    char off_buf[10];
+    int on_len = snprintf(on_buf, sizeof(on_buf), "%.1f", (double)heater_on_threshold);
+    int off_len = snprintf(off_buf, sizeof(off_buf), "%.1f", (double)heater_off_threshold);
+    if (on_len <= 0 || off_len <= 0)
+    {
+        return;
+    }
     if (esp_mqtt_client_publish(client, HEATER_STATE_TOPIC, state, 0, 1, 1) < 0 ||
-        esp_mqtt_client_publish(client, HEATER_MODE_TOPIC, mode, 0, 1, 1) < 0)
+        esp_mqtt_client_publish(client, HEATER_MODE_TOPIC, mode, 0, 1, 1) < 0 ||
+        esp_mqtt_client_publish(client, HEATER_ON_TOPIC, on_buf, on_len, 1, 1) < 0 ||
+        esp_mqtt_client_publish(client, HEATER_OFF_TOPIC, off_buf, off_len, 1, 1) < 0)
     {
         ESP_LOGW(TAG, "Failed to publish heater state; will retry");
         return;
     }
-    ESP_LOGI(TAG, "Published heater state=%s mode=%s", state, mode);
+    ESP_LOGI(TAG, "Published heater state=%s mode=%s on=%s off=%s", state, mode, on_buf, off_buf);
     last_on = heater_on;
     last_mode = heater_force_state;
+    last_on_decic = on_decic;
+    last_off_decic = off_decic;
     s_heater_state_dirty = false;
 }
 
@@ -922,6 +956,10 @@ static bool apply_heater_mode(heater_force_state_t mode, const char **error)
         if (blocked != NULL)
         {
             ESP_LOGW(TAG, "Refusing heater mode '%s': %s", heater_mode_name(mode), blocked);
+            /* Nothing moved, so nothing would be published - and a subscriber
+             * that asked for this mode would be left showing it. Re-assert
+             * what the mode really is instead. */
+            s_heater_state_dirty = true;
             *error = blocked;
             return false;
         }

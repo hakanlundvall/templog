@@ -42,37 +42,76 @@ so they stay as they are — which does mean they sit outside the `templog` devi
 
 ## Installing it
 
-Home Assistant reads this as a package. With Home Assistant deployed from
-`~/certbotazure/docker-compose.yaml`, whose config directory is
-`~/certbotazure/homeassistant/config`:
+[`install.sh`](install.sh) does it. Read it first — it edits
+`configuration.yaml` and restarts the container — then:
 
-1. Copy the file into the package directory:
+```bash
+./install.sh --dry-run   # says what it would do, changes nothing
+./install.sh             # does it, asking before the restart
+```
 
-   ```bash
-   mkdir -p ~/certbotazure/homeassistant/config/packages
-   cp ~/templog/homeassistant/templog.yaml ~/certbotazure/homeassistant/config/packages/
-   ```
+It copies `templog.yaml` into `<ha-config>/packages/`, appends a
+`homeassistant: packages: !include_dir_named packages` block to
+`configuration.yaml` after backing that file up, checks the result, and
+restarts. Every step is skipped if it has already been done, so re-running is
+safe; if a check fails the backup goes back and the container is left alone.
 
-2. Enable packages in `homeassistant/config/configuration.yaml`, which has no
-   `homeassistant:` key yet, so the whole block is new:
+By hand it is four steps, with `~/certbotazure/homeassistant/config` as the
+config directory:
+
+1. `mkdir -p <ha-config>/packages && cp templog.yaml <ha-config>/packages/`
+2. Add to `<ha-config>/configuration.yaml` — there is no `homeassistant:` key
+   yet, so the whole block is new:
 
    ```yaml
    homeassistant:
      packages: !include_dir_named packages
    ```
-
-3. Check it parses before restarting anything:
-
-   ```bash
-   docker exec homeassistant python -m homeassistant --script check_config -c /config
-   ```
-
+3. Check it (see below).
 4. Restart Home Assistant (*Developer Tools → Restart*, or
    `docker restart homeassistant`).
 
 After the first install, editing the copy needs no restart: *Developer Tools →
 YAML → Manually configured MQTT entities → Reload* is enough. Only the
 `packages:` key itself is read at startup.
+
+### Checking it before restarting
+
+`check_config` on its own is not enough, which is worth knowing before trusting
+it:
+
+```bash
+docker exec homeassistant python -m homeassistant --script check_config -c /config
+```
+
+It catches a YAML mistake, and a package naming an integration that does not
+exist — but it reports the latter with the words `Incorrect config` while still
+**exiting 0**, so its exit status cannot be the only gate. It also does not look
+inside `mqtt:` at all: an invalid `device_class` passes it as
+`Successful config`. On this installation it additionally prints a handful of
+pre-existing `ERROR` lines about automations referencing an unresolvable BTHome
+device, which have nothing to do with this package.
+
+What actually validates the entities is the per-platform schema the MQTT
+integration itself uses:
+
+```bash
+docker exec -i homeassistant python - /config/packages/templog.yaml <<'PY'
+import importlib, sys
+import voluptuous as vol, yaml
+config = yaml.safe_load(open(sys.argv[1]))["mqtt"]
+for platform, entities in config.items():
+    schema = importlib.import_module(
+        f"homeassistant.components.mqtt.{platform}").PLATFORM_SCHEMA_MODERN
+    for entity in entities:
+        try:
+            schema(dict(entity))
+        except vol.Invalid as err:
+            print(f"{platform}/{entity.get('name')}: {err}")
+PY
+```
+
+`install.sh` runs both.
 
 ### Avoiding the copy
 

@@ -878,13 +878,24 @@ private fun WifiCard(telemetry: Telemetry, enabled: Boolean, onEdit: () -> Unit)
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            telemetry.lastWifiDisconnect?.let { disc ->
+            val disc = telemetry.lastWifiDisconnect
+            if (disc != null) {
                 val reason = disc.reasonName?.let { "${disc.reason} ($it)" } ?: "${disc.reason}"
                 Text(
                     "Last: ${formatAge(disc.ageMs)} ago, reason $reason, ${disc.rssi} dBm",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            } else if (telemetry.wifiDisconnects == 0L) {
+                /* Nothing has dropped since boot, so the uptime is how long the
+                 * link has held - more use than an empty line. */
+                telemetry.uptimeS?.let { seconds ->
+                    Text(
+                        "No dropouts in the ${formatAge(seconds * 1000)} since boot",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             OutlinedButton(onClick = onEdit, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
                 Text("Change credentials")
@@ -1356,6 +1367,7 @@ private fun formatAge(ms: Long): String {
     return when {
         seconds < 60 -> "${seconds}s"
         seconds < 3600 -> "${seconds / 60}m ${seconds % 60}s"
-        else -> "${seconds / 3600}h ${(seconds % 3600) / 60}m"
+        seconds < 86400 -> "${seconds / 3600}h ${(seconds % 3600) / 60}m"
+        else -> "${seconds / 86400}d ${(seconds % 86400) / 3600}h"
     }
 }

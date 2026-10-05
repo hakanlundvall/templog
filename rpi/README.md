@@ -158,7 +158,9 @@ means the sensor has never produced a valid reading. `onC`/`offC` are the
 current heater thresholds and `forceState` is `0` (automatic), `1` (forced
 off until start conditions are met again), `2` (forced off until explicitly
 started) or `3` (finishing one heating cycle, after which the device sets
-itself to `2`).
+itself to `2`). `upS` is seconds since the device booted; with `wifi.disc` at
+zero it is also how long the Wi-Fi link has held, which is what the clients
+show in place of a last-disconnect line.
 
 Firmware can also be pushed straight to the device over BLE by the Android
 app, for a device whose Wi-Fi is not working; `templogctl` only triggers the
@@ -215,6 +217,30 @@ or supply reading is missing or more than two minutes old; `state` is then
 
 The controller also mirrors itself onto MQTT as retained messages:
 `temp/1/shunt/state`, `temp/1/shunt/setpoint` and `temp/1/shunt/bursts`.
+
+## Switching the heater mode over MQTT
+
+Alongside BLE, the mode can be set by publishing to `temp/1/heater/mode/set`.
+The payload is one of the four names the device reports on
+`temp/1/heater/mode`, so whatever is read off the state topic can be written
+straight back to the command topic:
+
+| Payload | Effect |
+| --- | --- |
+| `auto` | Thresholds decide, as `heater-on` does |
+| `off_until_conditions` | Off until the start conditions are met again |
+| `off_until_started` | Off until a mode is asked for that starts it |
+| `heat_once` | One cycle, then `off_until_started` |
+
+The same rule as over BLE applies: `auto` and `heat_once` are refused unless a
+sensor in the `water` role has reported recently, and a refusal leaves the mode
+untouched. There is no reply topic — the outcome is the mode that comes back on
+`temp/1/heater/mode`, which is retained and republished whenever it changes.
+
+**Publish without the retain flag.** A retained command would be replayed by
+the broker on every reconnect, which for `heat_once` would quietly start a
+fresh cycle each time the link bounced. The device ignores a retained message
+on this topic for that reason, and logs that it did.
 
 `set-mqtt` restarts the ESP32's MQTT client against the new broker straight
 away and only persists the URL once the client accepts it, so a URL the client

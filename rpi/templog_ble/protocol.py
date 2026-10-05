@@ -78,3 +78,15 @@ HEATER_MODE_NAMES = {
     HEATER_MODE_OFF_UNTIL_STARTED: "off_until_started",
     HEATER_MODE_HEAT_ONCE: "heat_once",
 }
+
+# The device reports its mode on the first topic and takes one on the second,
+# both using the names above, so what is read back can be written straight out
+# again. These are not used by this client, which speaks BLE; they are here
+# because this module is where the device's protocol is written down.
+#
+# A command must be published WITHOUT the retain flag: the broker would replay
+# a retained one on every reconnect, and "heat_once" would then quietly start a
+# fresh cycle each time the link bounced. The device ignores retained messages
+# on the command topic for that reason.
+HEATER_MODE_STATE_TOPIC = "temp/1/heater/mode"
+HEATER_MODE_COMMAND_TOPIC = "temp/1/heater/mode/set"

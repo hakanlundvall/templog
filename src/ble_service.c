@@ -688,6 +688,9 @@ void ble_service_update_telemetry(const ble_telemetry_t *telemetry)
 
     /* Live state: everything that moves on its own. */
     cJSON *root = cJSON_CreateObject();
+    /* Seconds since boot. With no disconnects to date this is also how long the
+     * Wi-Fi link has held, which is what the clients show in its place. */
+    cJSON_AddNumberToObject(root, "upS", telemetry->uptime_s);
     cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
     cJSON_AddBoolToObject(wifi, "c", telemetry->wifi_connected);
     if (telemetry->wifi_rssi_valid) {

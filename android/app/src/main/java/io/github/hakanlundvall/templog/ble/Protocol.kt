@@ -411,6 +411,13 @@ data class Telemetry(
     /** Disconnect events since boot; null on firmware that does not report it. */
     val wifiDisconnects: Long?,
     val lastWifiDisconnect: WifiDisconnect?,
+    /**
+     * Seconds since the device booted; null on firmware that does not report
+     * it. With no disconnects to date it is also how long the Wi-Fi link has
+     * held, which is what the Wi-Fi card shows in place of a last-disconnect
+     * line.
+     */
+    val uptimeS: Long?,
     val mqttConnected: Boolean,
     val mqttUrl: String,
     val heaterOn: Boolean,
@@ -487,6 +494,7 @@ data class Telemetry(
                 } else {
                     null
                 },
+                uptimeS = if (root.has("upS")) root.getLong("upS") else null,
                 mqttConnected = mqtt?.optBoolean("c", false) ?: false,
                 mqttUrl = root.optString("url"),
                 heaterOn = root.optBoolean("heater", false),

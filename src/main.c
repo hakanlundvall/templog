@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -309,6 +310,50 @@ void wifi_init_sta(void)
     }
 }
 
+#define HEATER_STATE_TOPIC "temp/1/heater"
+#define HEATER_MODE_TOPIC "temp/1/heater/mode"
+/* Where a mode is asked for, as against HEATER_MODE_TOPIC where it is
+ * reported. The payload is one of the names below, so whatever is read off the
+ * state topic can be written straight back to this one. */
+#define HEATER_MODE_SET_TOPIC "temp/1/heater/mode/set"
+
+static const char *heater_mode_name(heater_force_state_t state)
+{
+    switch (state)
+    {
+    case HEATER_FORCE_OFF_UNTIL_CONDITIONS:
+        return "off_until_conditions";
+    case HEATER_FORCE_OFF_UNTIL_STARTED:
+        return "off_until_started";
+    case HEATER_RUN_ONCE:
+        return "heat_once";
+    case HEATER_FORCE_NONE:
+    default:
+        return "auto";
+    }
+}
+
+/* The inverse, for the command topic. False when the payload names no mode, in
+ * which case nothing happens: a typo must not move the heater. */
+static bool heater_mode_from_name(const char *name, heater_force_state_t *out)
+{
+    static const heater_force_state_t modes[] = {
+        HEATER_FORCE_NONE,
+        HEATER_FORCE_OFF_UNTIL_CONDITIONS,
+        HEATER_FORCE_OFF_UNTIL_STARTED,
+        HEATER_RUN_ONCE,
+    };
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i)
+    {
+        if (strcmp(name, heater_mode_name(modes[i])) == 0)
+        {
+            *out = modes[i];
+            return true;
+        }
+    }
+    return false;
+}
+
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
@@ -322,13 +367,14 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         s_heater_state_dirty = true;
         // esp_mqtt_client_publish(event->client, "temp/1/status", "connected", 0, 1, 0);
 
-        /* Subscriptions do not survive a reconnect, so the indoor topic is
-         * taken again every time the session comes back. */
+        /* Subscriptions do not survive a reconnect, so they are taken again
+         * every time the session comes back. */
         if (has_indoor_topic())
         {
             esp_mqtt_client_subscribe(event->client, indoor_topic, 0);
             ESP_LOGI(TAG, "Subscribed to indoor temperature topic %s", indoor_topic);
         }
+        esp_mqtt_client_subscribe(event->client, HEATER_MODE_SET_TOPIC, 1);
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -348,6 +394,49 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
         printf("DATA=%.*s\r\n", event->data_len, event->data);
+        /* A mode asked for on the command topic. It is applied through the
+         * command queue rather than here, because the heater output and its
+         * mode belong to the application task; this one only decodes.
+         *
+         * A retained message is ignored on purpose. The broker would replay it
+         * on every reconnect, which for heat_once would silently start a fresh
+         * cycle each time the link bounced. */
+        if ((size_t)event->topic_len == strlen(HEATER_MODE_SET_TOPIC) &&
+            strncmp(event->topic, HEATER_MODE_SET_TOPIC, event->topic_len) == 0)
+        {
+            char payload[32];
+            heater_force_state_t mode;
+            if (event->retain)
+            {
+                ESP_LOGW(TAG, "Ignoring retained heater mode command; publish it without the retain flag");
+            }
+            else if ((size_t)event->data_len >= sizeof(payload))
+            {
+                ESP_LOGW(TAG, "Ignoring oversized heater mode command");
+            }
+            else
+            {
+                memcpy(payload, event->data, event->data_len);
+                payload[event->data_len] = '\0';
+                if (!heater_mode_from_name(payload, &mode))
+                {
+                    ESP_LOGW(TAG, "Ignoring unknown heater mode '%s'", payload);
+                }
+                else
+                {
+                    ble_command_t cmd = {
+                        .type = BLE_CMD_SET_HEATER_MODE,
+                        .data.heater_mode.mode = (int)mode,
+                    };
+                    if (g_ble_cmd_queue == NULL ||
+                        xQueueSend(g_ble_cmd_queue, &cmd, 0) != pdTRUE)
+                    {
+                        ESP_LOGW(TAG, "Dropped heater mode command '%s': queue full", payload);
+                    }
+                }
+            }
+            break;
+        }
         /* The indoor temperature, if this is it. A payload is a bare number;
          * anything else is dropped, so the reading simply goes stale and the
          * curve carries the heating on its own. */
@@ -519,25 +608,6 @@ static void mqtt_publish(const char *topic, const char *payload, int len)
     }
     int msg_id = esp_mqtt_client_publish(client, topic, payload, len, 1, 0);
     ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
-}
-
-#define HEATER_STATE_TOPIC "temp/1/heater"
-#define HEATER_MODE_TOPIC "temp/1/heater/mode"
-
-static const char *heater_mode_name(heater_force_state_t state)
-{
-    switch (state)
-    {
-    case HEATER_FORCE_OFF_UNTIL_CONDITIONS:
-        return "off_until_conditions";
-    case HEATER_FORCE_OFF_UNTIL_STARTED:
-        return "off_until_started";
-    case HEATER_RUN_ONCE:
-        return "heat_once";
-    case HEATER_FORCE_NONE:
-    default:
-        return "auto";
-    }
 }
 
 /* Publishes the heater output and mode as retained messages whenever either
@@ -835,6 +905,63 @@ static void set_heater_force_state(heater_force_state_t state)
     }
 }
 
+/* Switches to `mode`, which the app, the CLI and the MQTT command topic all
+ * ask for by different names. Returns false with *error set when the mode would
+ * run the heater and there is nothing to stop it by, in which case nothing
+ * changes at all - not even the mode, since a start that cannot be honoured
+ * should leave the device exactly as it was.
+ *
+ * Only the application task may call this: it moves the output. */
+static bool apply_heater_mode(heater_force_state_t mode, const char **error)
+{
+    /* Switching the heater off is always allowed; starting it is not, unless
+     * the water temperature that ends the cycle can be trusted. */
+    if (mode == HEATER_FORCE_NONE || mode == HEATER_RUN_ONCE)
+    {
+        const char *blocked = heater_no_water_reason();
+        if (blocked != NULL)
+        {
+            ESP_LOGW(TAG, "Refusing heater mode '%s': %s", heater_mode_name(mode), blocked);
+            *error = blocked;
+            return false;
+        }
+    }
+
+    bool start = false;
+    switch (mode)
+    {
+    case HEATER_FORCE_NONE:
+        start = last_water_temp < heater_off_threshold;
+        if (!start)
+        {
+            ESP_LOGI(TAG, "Heater start requested but water temperature %.1f is above the off threshold",
+                     last_water_temp);
+        }
+        break;
+    case HEATER_RUN_ONCE:
+        start = last_water_temp < heater_off_threshold;
+        if (!start)
+        {
+            /* Asking for one cycle when the water is already hot enough is not
+             * an error, but there is no cycle to run: the stop condition is met
+             * on arrival, so the mode it would have ended in is the mode it
+             * starts in. */
+            ESP_LOGI(TAG, "Single heating cycle requested but water temperature %.1f is already at the stop condition",
+                     last_water_temp);
+            mode = HEATER_FORCE_OFF_UNTIL_STARTED;
+        }
+        break;
+    default:
+        break;
+    }
+
+    set_heater_force_state(mode);
+    heater_on = start;
+    gpio_set_level(GPIO_HEATER, heater_on);
+    ESP_LOGI(TAG, "Heater mode '%s', output %s", heater_mode_name(mode), heater_on ? "on" : "off");
+    return true;
+}
+
 static void process_ble_commands(void)
 {
     ble_command_t cmd;
@@ -1008,69 +1135,36 @@ static void process_ble_commands(void)
         }
         case BLE_CMD_HEATER_FORCE_OFF:
         {
-            set_heater_force_state(cmd.data.heater_force_off.mode == BLE_HEATER_FORCE_OFF_UNTIL_STARTED
-                                       ? HEATER_FORCE_OFF_UNTIL_STARTED
-                                       : HEATER_FORCE_OFF_UNTIL_CONDITIONS);
-            heater_on = false;
-            gpio_set_level(GPIO_HEATER, heater_on);
-            ESP_LOGI(TAG, "Heater forced off (mode=%d)", (int)heater_force_state);
-            ble_service_report_status("heater_off", true, NULL);
+            const char *error = NULL;
+            bool ok = apply_heater_mode(cmd.data.heater_force_off.mode == BLE_HEATER_FORCE_OFF_UNTIL_STARTED
+                                            ? HEATER_FORCE_OFF_UNTIL_STARTED
+                                            : HEATER_FORCE_OFF_UNTIL_CONDITIONS,
+                                        &error);
+            ble_service_report_status("heater_off", ok, error);
             break;
         }
         case BLE_CMD_HEATER_ON:
         {
-            const char *blocked = heater_no_water_reason();
-            if (blocked != NULL)
-            {
-                /* Nothing changes, not even the mode: a start that cannot be
-                 * honoured should leave the device exactly as it was. */
-                ESP_LOGW(TAG, "Refusing to start the heater: %s", blocked);
-                ble_service_report_status("heater_on", false, blocked);
-                break;
-            }
-            set_heater_force_state(HEATER_FORCE_NONE);
-            if (last_water_temp >= heater_off_threshold)
-            {
-                heater_on = false;
-                ESP_LOGI(TAG, "Heater start requested but water temperature %.1f is above threshold", last_water_temp);
-            }
-            else
-            {
-                heater_on = true;
-                ESP_LOGI(TAG, "Heater started via BLE command");
-            }
-            gpio_set_level(GPIO_HEATER, heater_on);
-            ble_service_report_status("heater_on", true, NULL);
+            const char *error = NULL;
+            bool ok = apply_heater_mode(HEATER_FORCE_NONE, &error);
+            ble_service_report_status("heater_on", ok, error);
             break;
         }
         case BLE_CMD_HEATER_ONCE:
         {
-            const char *blocked = heater_no_water_reason();
-            if (blocked != NULL)
-            {
-                ESP_LOGW(TAG, "Refusing to start a heating cycle: %s", blocked);
-                ble_service_report_status("heater_once", false, blocked);
-                break;
-            }
-            /* Asking for one cycle when the water is already hot enough is not
-             * an error, but there is no cycle to run: the stop condition is met
-             * on arrival, so the mode it would have ended in is the mode it
-             * starts in. */
-            if (last_water_temp >= heater_off_threshold)
-            {
-                set_heater_force_state(HEATER_FORCE_OFF_UNTIL_STARTED);
-                heater_on = false;
-                ESP_LOGI(TAG, "Single heating cycle requested but water temperature %.1f is already at the stop condition",
-                         last_water_temp);
-            }
-            else
-            {
-                set_heater_force_state(HEATER_RUN_ONCE);
-                heater_on = true;
-                ESP_LOGI(TAG, "Single heating cycle started; will stop at %.1f C", heater_off_threshold);
-            }
-            gpio_set_level(GPIO_HEATER, heater_on);
-            ble_service_report_status("heater_once", true, NULL);
+            const char *error = NULL;
+            bool ok = apply_heater_mode(HEATER_RUN_ONCE, &error);
+            ble_service_report_status("heater_once", ok, error);
+            break;
+        }
+        case BLE_CMD_SET_HEATER_MODE:
+        {
+            /* From the MQTT command topic, so there is no status
+             * characteristic to answer on: the outcome is the mode that
+             * publish_heater_state() puts back on the state topic, and a
+             * refusal is logged by apply_heater_mode(). */
+            const char *error = NULL;
+            (void)apply_heater_mode((heater_force_state_t)cmd.data.heater_mode.mode, &error);
             break;
         }
         case BLE_CMD_OTA_UPDATE:
@@ -1154,6 +1248,7 @@ static void publish_telemetry(void)
         telemetry.wifi_rssi_valid = true;
         telemetry.wifi_rssi = ap_info.rssi;
     }
+    telemetry.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000);
     telemetry.wifi_disconnect_count = s_wifi_disconnect_count;
     telemetry.wifi_last_disc_reason = s_wifi_last_disc_reason;
     telemetry.wifi_last_disc_rssi = s_wifi_last_disc_rssi;

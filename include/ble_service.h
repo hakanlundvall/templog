@@ -39,6 +39,7 @@ typedef struct {
     uint8_t wifi_last_disc_reason;    /* wifi_err_reason_t of the last one; 0 = none yet */
     int8_t wifi_last_disc_rssi;       /* RSSI reported with the last disconnect, dBm */
     uint32_t wifi_last_disc_age_ms;   /* time since the last disconnect; UINT32_MAX if none */
+    uint32_t uptime_s;                /* seconds since boot; with no disconnects, how long the link has held */
     bool mqtt_connected;
     char mqtt_url[BLE_MQTT_URL_LEN];
     bool heater_on;
@@ -93,6 +94,12 @@ typedef enum {
     BLE_CMD_HEATER_FORCE_OFF,
     BLE_CMD_HEATER_ON,
     BLE_CMD_HEATER_ONCE,
+    /* Switches the mode by name. Unlike the rest, this one does not come from
+     * BLE at all: it is how the application hands itself a mode asked for on
+     * the MQTT command topic, so that the heater is only ever touched from the
+     * task that owns it. Nothing is reported on the status characteristic for
+     * it, since no BLE client is waiting for a reply. */
+    BLE_CMD_SET_HEATER_MODE,
     BLE_CMD_OTA_UPDATE,
     BLE_CMD_OTA_BLE_BEGIN,
     BLE_CMD_OTA_BLE_END,
@@ -155,6 +162,9 @@ typedef struct {
         struct {
             ble_heater_force_mode_t mode;
         } heater_force_off;
+        struct {
+            int mode; /* a heater_force_state_t, which only main.c names */
+        } heater_mode;
         struct {
             char tag[BLE_OTA_TAG_LEN];
             bool force;

@@ -14,12 +14,16 @@
 
 mqtt:
   binary_sensor:
-    # The device's own connection state, and the only entity here without an
-    # availability topic of its own - it is the availability topic.
+    # The device's own connection state: "start" when it connects, and
+    # "disconnected" from the last will when it drops off.
     #
-    # The firmware publishes "start" on connect and leaves "disconnected" as
-    # its last will, both retained, so a subscriber that arrives after the
-    # device dropped off still learns that it is gone.
+    # Note this only tracks transitions that happen while Home Assistant is
+    # subscribed. This broker, the Zenoh router's MQTT plugin, does not deliver
+    # retained messages to a subscriber at all - verified by subscribing to
+    # temp/# and watching every arriving message come in with retain unset - so
+    # a topic that is published only on a change reads as unknown until the next
+    # one. That is also why no entity here uses an availability topic: it would
+    # make every one of them permanently unavailable.
     - name: "Online"
       unique_id: templog_online
       state_topic: "temp/1/status"
@@ -39,9 +43,6 @@ mqtt:
       payload_on: "on"
       payload_off: "off"
       device_class: running
-      availability_topic: &templog_availability "temp/1/status"
-      payload_available: &templog_available "start"
-      payload_not_available: &templog_not_available "disconnected"
       device: *templog_device
 
   select:
@@ -54,9 +55,8 @@ mqtt:
     # an error.
     #
     # retain MUST stay false. The firmware ignores a retained message on the
-    # command topic on purpose, because this broker would replay it on every
-    # reconnect and heat_once would start a fresh cycle each time the link
-    # bounced.
+    # command topic on purpose, so that a broker which does replay them cannot
+    # start a fresh heat_once cycle every time the link bounces.
     - name: "Heater mode"
       unique_id: templog_heater_mode
       state_topic: "temp/1/heater/mode"
@@ -67,9 +67,6 @@ mqtt:
         - "off_until_started"
         - "heat_once"
       retain: false
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device
 
   button:
@@ -83,9 +80,6 @@ mqtt:
       payload_press: "heat_once"
       retain: false
       icon: mdi:water-boiler
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device
 
   sensor:
@@ -97,9 +91,6 @@ mqtt:
       unit_of_measurement: "°C"
       device_class: temperature
       state_class: measurement
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device
 
     - name: "Heater off threshold"
@@ -108,9 +99,6 @@ mqtt:
       unit_of_measurement: "°C"
       device_class: temperature
       state_class: measurement
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device
 
     # The shunt valve controller. "holding" means an input it regulates on is
@@ -119,9 +107,6 @@ mqtt:
       unique_id: templog_shunt_state
       state_topic: "temp/1/shunt/state"
       icon: mdi:valve
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device
 
     # The supply temperature the heating curve asks for, which is worth
@@ -132,9 +117,6 @@ mqtt:
       unit_of_measurement: "°C"
       device_class: temperature
       state_class: measurement
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device
 
     # Corrections made in a row in one direction, positive towards warmer. A
@@ -146,9 +128,6 @@ mqtt:
       state_class: measurement
       icon: mdi:counter
       entity_category: diagnostic
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device
 
     # Failed reads per sensor since boot, by ROM code. Named after the role
@@ -160,9 +139,6 @@ mqtt:
       state_class: total_increasing
       icon: mdi:alert-circle-outline
       entity_category: diagnostic
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device
 
     - name: "Read errors supply"
@@ -171,9 +147,6 @@ mqtt:
       state_class: total_increasing
       icon: mdi:alert-circle-outline
       entity_category: diagnostic
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device
 
     - name: "Read errors outdoor"
@@ -182,7 +155,4 @@ mqtt:
       state_class: total_increasing
       icon: mdi:alert-circle-outline
       entity_category: diagnostic
-      availability_topic: *templog_availability
-      payload_available: *templog_available
-      payload_not_available: *templog_not_available
       device: *templog_device

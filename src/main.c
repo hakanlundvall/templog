@@ -321,6 +321,18 @@ void wifi_init_sta(void)
 #define HEATER_ON_TOPIC "temp/1/heater/on_c"
 #define HEATER_OFF_TOPIC "temp/1/heater/off_c"
 
+/* How often the state topics are republished even though nothing changed.
+ *
+ * Publishing only on a change assumes the broker keeps the retained value and
+ * hands it to whoever subscribes later. Not every broker does: the Zenoh
+ * router's MQTT plugin, which this installation uses, delivers no retained
+ * messages at all, so a subscriber that arrives between two changes sees
+ * nothing and a topic that rarely changes - the mode, the thresholds - reads as
+ * unknown indefinitely. Repeating the current state on a slow timer costs a
+ * handful of small messages a minute and makes any subscriber correct within
+ * that minute, whatever the broker does about retention. */
+#define MQTT_REPUBLISH_PERIOD_MS 60000
+
 static const char *heater_mode_name(heater_force_state_t state)
 {
     switch (state)
@@ -637,11 +649,14 @@ static void publish_heater_state(void)
     static int last_on_decic = INT32_MIN;
     static int last_off_decic = INT32_MIN;
 
+    static TickType_t last_published;
+
     int on_decic = (int)lroundf(heater_on_threshold * 10.0f);
     int off_decic = (int)lroundf(heater_off_threshold * 10.0f);
 
     if (heater_on != last_on || heater_force_state != last_mode ||
-        on_decic != last_on_decic || off_decic != last_off_decic)
+        on_decic != last_on_decic || off_decic != last_off_decic ||
+        (xTaskGetTickCount() - last_published) >= pdMS_TO_TICKS(MQTT_REPUBLISH_PERIOD_MS))
     {
         s_heater_state_dirty = true;
     }
@@ -650,6 +665,11 @@ static void publish_heater_state(void)
     {
         return;
     }
+
+    /* The device's own "I am here", on the same timer. The last will says
+     * "disconnected" and is delivered as it happens, so the pair reads as
+     * liveness even on a broker that keeps nothing. */
+    esp_mqtt_client_publish(client, mqtt_status_topic, "start", 0, 1, 1);
 
     const char *state = heater_on ? "on" : "off";
     const char *mode = heater_mode_name(heater_force_state);
@@ -674,6 +694,7 @@ static void publish_heater_state(void)
     last_mode = heater_force_state;
     last_on_decic = on_decic;
     last_off_decic = off_decic;
+    last_published = xTaskGetTickCount();
     s_heater_state_dirty = false;
 }
 
@@ -683,13 +704,16 @@ static void publish_heater_state(void)
 
 /* Mirrors what the shunt controller is doing onto MQTT, retained, so Home
  * Assistant can graph the setpoint next to the measured supply temperature.
- * Like the heater state, only changes are sent, and nothing at all while the
- * broker is unreachable. */
+ * Like the heater state, changes are sent as they happen and the current values
+ * are repeated every MQTT_REPUBLISH_PERIOD_MS regardless, so a subscriber does
+ * not have to wait for the next change to learn where things stand. Nothing at
+ * all is sent while the broker is unreachable. */
 static void publish_shunt_state(void)
 {
     static char last_state[16];
     static int last_setpoint_decic = INT32_MIN;
     static int last_bursts = 0;
+    static TickType_t last_published;
 
     esp_mqtt_client_handle_t client = g_mqtt_client;
     if (client == NULL || !s_mqtt_connected)
@@ -702,8 +726,9 @@ static void publish_shunt_state(void)
     const char *state = shunt_state_name(status.state);
     int setpoint_decic = isnan(status.setpoint_c) ? INT32_MIN : (int)lroundf(status.setpoint_c * 10.0f);
     int bursts = status.bursts;
+    bool force = (xTaskGetTickCount() - last_published) >= pdMS_TO_TICKS(MQTT_REPUBLISH_PERIOD_MS);
 
-    if (strcmp(state, last_state) != 0)
+    if (force || strcmp(state, last_state) != 0)
     {
         if (esp_mqtt_client_publish(client, SHUNT_STATE_TOPIC, state, 0, 1, 1) < 0)
         {
@@ -711,7 +736,7 @@ static void publish_shunt_state(void)
         }
         strlcpy(last_state, state, sizeof(last_state));
     }
-    if (setpoint_decic != last_setpoint_decic && setpoint_decic != INT32_MIN)
+    if ((force || setpoint_decic != last_setpoint_decic) && setpoint_decic != INT32_MIN)
     {
         char buf[10];
         int len = snprintf(buf, sizeof(buf), "%.1f", (double)status.setpoint_c);
@@ -723,7 +748,7 @@ static void publish_shunt_state(void)
     }
     /* How many corrections in a row it has needed, so a valve sitting against
      * an end stop, or a boiler that cannot keep up, shows up on a graph. */
-    if (bursts != last_bursts)
+    if (force || bursts != last_bursts)
     {
         char buf[10];
         int len = snprintf(buf, sizeof(buf), "%d", bursts);
@@ -732,6 +757,12 @@ static void publish_shunt_state(void)
             return;
         }
         last_bursts = bursts;
+    }
+    /* Only once all three are out, so a failed publish is retried next tick
+     * rather than waiting a whole period. */
+    if (force)
+    {
+        last_published = xTaskGetTickCount();
     }
 }
 
